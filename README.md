@@ -1,57 +1,66 @@
-Guava
-Distributed Neural Network Training Over Network
+# Guava
+
+**Distributed Neural Network Training Over Network**
+
 A modular, pip-installable framework for distributed deep learning training across multiple GPUs and machines. Built for flexibility, performance, and ease of use.
-🚀 Features
 
-Multiple Parallelism Strategies
+---
 
-Data Parallelism: Train on different batches across GPUs
-Model Parallelism: Split model layers across GPUs
-Pipeline Parallelism: Micro-batch pipelining for efficiency
-Tensor Parallelism: Split tensors within layers (single-node)
-Hybrid Parallelism: Combine strategies for maximum scalability
+## 🚀 Features
 
+### Multiple Parallelism Strategies
+- **Data Parallelism:** Train on different batches across GPUs  
+- **Model Parallelism:** Split model layers across GPUs  
+- **Pipeline Parallelism:** Micro-batch pipelining for efficiency  
+- **Tensor Parallelism:** Split tensors within layers (single-node)  
+- **Hybrid Parallelism:** Combine strategies for maximum scalability  
 
-Network-Optimized Communication
+### Network-Optimized Communication
+- Optimized socket configurations for low latency and high throughput  
+- Automatic compression and serialization  
+- Robust error handling and recovery  
+- TCP keepalive and buffer tuning  
 
-Optimized socket configurations for low latency and high throughput
-Automatic compression and serialization
-Robust error handling and recovery
-TCP keepalive and buffer tuning
+### Flexible Architecture
+- Easy integration with any PyTorch model  
+- Support for custom data loaders  
+- Checkpoint and resume capabilities  
+- Comprehensive logging and metrics  
 
+### Runtime Behavior
+- Automatic reconnection on failures  
+- CUDA error recovery  
+- Memory management  
+- Progress tracking with tqdm  
 
-Flexible Architecture
+---
 
-Easy integration with any PyTorch model
-Support for custom data loaders
-Checkpoint and resume capabilities
-Comprehensive logging and metrics
+## 📦 Installation
 
+```bash
+pip install guava
+```
 
-Runtime Behavior
-
-Automatic reconnection on failures
-CUDA error recovery
-Memory management
-Progress tracking with tqdm
-
-
-
-📦 Installation
-bashpip install guava
 Or install from source:
-bashgit clone https://github.com/yourusername/guava.git
+
+```bash
+git clone https://github.com/yourusername/guava.git
 cd guava
 pip install -e .
-Requirements
+```
 
-Python >= 3.8
-PyTorch >= 2.0.0
-CUDA-capable GPUs (for GPU training)
+### Requirements
+- Python >= 3.8  
+- PyTorch >= 2.0.0  
+- CUDA-capable GPUs (for GPU training)
 
-🎯 Quick Start
-1. Single Machine, Multiple GPUs (Data Parallel)
-pythonfrom guava import DistributedConfig, Orchestrator
+---
+
+## 🎯 Quick Start
+
+### 1. Single Machine, Multiple GPUs (Data Parallel)
+```python
+from guava import DistributedConfig, Orchestrator
 import torch
 import torch.nn as nn
 
@@ -89,9 +98,13 @@ orchestrator.register_model(model)
 
 # Start training
 orchestrator.start_training(your_dataloader, num_epochs=10)
-2. Multi-Machine Training (Distributed)
-On Orchestrator Node:
-pythonfrom guava import DistributedConfig, Orchestrator
+```
+
+### 2. Multi-Machine Training (Distributed)
+
+**On Orchestrator Node:**
+```python
+from guava import DistributedConfig, Orchestrator
 
 config = DistributedConfig(
     vocab_size=50000,
@@ -105,69 +118,81 @@ config = DistributedConfig(
 orchestrator = Orchestrator(config, mode='orchestrator')
 orchestrator.register_model(model)
 orchestrator.start_training(dataloader, num_epochs=10)
-On Worker Nodes:
-pythonfrom guava import NetworkWorker, DistributedConfig
+```
+
+**On Worker Nodes:**
+```python
+from guava import NetworkWorker, DistributedConfig
 
 config = DistributedConfig.from_env() # Load from environment
 
-# Start worker process
 worker = NetworkWorker(
-    gpu_id=0, # Local GPU ID
+    gpu_id=0,
     config=config,
     model_ctor=lambda: MyTransformer(config.vocab_size, config.d_model),
     master_ip="192.168.1.100",
     master_port=29500
 )
-worker.connect_and_train() # Auto-reconnects on failures
-3. Model Parallelism (Large Models)
-pythonfrom guava import DistributedConfig, Orchestrator
+worker.connect_and_train()
+```
+
+### 3. Model Parallelism (Large Models)
+```python
+from guava import DistributedConfig, Orchestrator
 
 config = DistributedConfig(
     vocab_size=50000,
-    d_model=4096, # Large model
+    d_model=4096,
     n_layers=48,
     num_workers=4,
-    model_parallel=True, # Split layers across GPUs
-    pipeline_parallel=True, # Enable pipelining
-    micro_batches=4 # Pipeline micro-batches
+    model_parallel=True,
+    pipeline_parallel=True,
+    micro_batches=4
 )
 
 orchestrator = Orchestrator(config)
 orchestrator.register_model(large_model)
 orchestrator.start_training(dataloader, num_epochs=10)
-🔧 Configuration
-Environment Variables
-Control behavior via environment variables:
-bash# Parallelism Strategy
-export DATA_PARALLEL=1 # Enable data parallelism (default: 1)
-export MODEL_PARALLEL=0 # Enable model parallelism (default: 0)
-export PIPELINE_PARALLEL=0 # Enable pipeline parallelism (default: 0)
-export TENSOR_PARALLEL=0 # Enable tensor parallelism (default: 0)
+```
+
+---
+
+## 🔧 Configuration
+
+### Environment Variables
+```bash
+# Parallelism Strategy
+export DATA_PARALLEL=1
+export MODEL_PARALLEL=0
+export PIPELINE_PARALLEL=0
+export TENSOR_PARALLEL=0
 
 # Pipeline Configuration
-export MICRO_BATCHES=4 # Number of micro-batches (default: 4)
-export TENSOR_PARALLEL_SIZE=2 # GPUs for tensor parallel group (default: 2)
+export MICRO_BATCHES=4
+export TENSOR_PARALLEL_SIZE=2
 
 # Communication Timeouts
-export ACT_TIMEOUT_SEC=60 # Activation timeout (0 = no timeout)
-export ACK_TIMEOUT_SEC=30 # Acknowledgment timeout
-export RESENDS_MAX=3 # Max resend attempts
-export RESEND_PROBE_SEC=5 # Resend probe interval
+export ACT_TIMEOUT_SEC=60
+export ACK_TIMEOUT_SEC=30
+export RESENDS_MAX=3
+export RESEND_PROBE_SEC=5
 
 # Optimization
-export ALLOW_ACT_REUSE=0 # Cache activation reuse (default: 0)
-export ACT_CACHE_STEPS=256 # Activation cache size
+export ALLOW_ACT_REUSE=0
+export ACT_CACHE_STEPS=256
 
 # Logging
-export COMPACT_LOG=1 # Compact logging (default: 1)
-export LOG_STEP_EVERY=100 # Log interval
-export LOG_ACT=0 # Log activations (default: 0)
-Configuration Object
-pythonfrom guava import DistributedConfig
+export COMPACT_LOG=1
+export LOG_STEP_EVERY=100
+export LOG_ACT=0
+```
+
+### Configuration Object
+```python
+from guava import DistributedConfig
 import torch
 
 config = DistributedConfig(
-    # Model architecture
     vocab_size=50257,
     d_model=768,
     n_heads=12,
@@ -176,74 +201,83 @@ config = DistributedConfig(
     max_seq_len=1024,
     dropout=0.1,
    
-    # Training hyperparameters
     batch_size=16,
     learning_rate=3e-4,
     weight_decay=0.01,
     max_grad_norm=1.0,
     use_amp=False,
    
-    # Distributed setup
     num_workers=4,
     master_ip="localhost",
     master_port=29500,
    
-    # Parallelism strategy
     data_parallel=True,
     model_parallel=False,
     pipeline_parallel=False,
     tensor_parallel=False,
    
-    # Checkpointing
     checkpoint_dir="./checkpoints",
     save_interval=1000,
 )
 
-# Auto-adapt to available GPUs
 config.adapt_to_gpus(torch.cuda.device_count())
-📚 Architecture
-Component Overview
-textguava/
-├── config.py # Configuration management
-├── protocol.py # Message protocol and serialization
-├── orchestrator.py # Central coordinator
-├── base_worker.py # Worker base classes
-├── network_worker.py # Network-connected worker
-├── socket_utils.py # Socket optimization utilities
+```
+
+---
+
+## 📚 Architecture
+
+### Component Overview
+```
+guava/
+├── config.py
+├── protocol.py
+├── orchestrator.py
+├── base_worker.py
+├── network_worker.py
+├── socket_utils.py
 └── __init__.py
-Communication Protocol
+```
+
+### Communication Protocol
 The framework uses a length-prefixed message protocol:
-text[4 bytes: length] [N bytes: compressed pickled data]
-Message Types:
+```
+[4 bytes: length] [N bytes: compressed pickled data]
+```
 
-Control: HELLO, READY, START_TRAINING, STOP_TRAINING, HEARTBEAT
-Data: BATCH_DATA, ACTIVATIONS, GRADIENTS, LABELS
-Model: MODEL_CONFIG, MODEL_WEIGHTS, MODEL_UPDATE
-Metrics: LOSS, METRICS
+**Message Types:**
+- Control: HELLO, READY, START_TRAINING, STOP_TRAINING, HEARTBEAT  
+- Data: BATCH_DATA, ACTIVATIONS, GRADIENTS, LABELS  
+- Model: MODEL_CONFIG, MODEL_WEIGHTS, MODEL_UPDATE  
+- Metrics: LOSS, METRICS  
 
-Socket Optimizations
+**Socket Optimizations:**
+- TCP_NODELAY  
+- SO_KEEPALIVE  
+- 16MB buffers (8MB on macOS)  
+- zlib compression  
 
-TCP_NODELAY: Disabled Nagle's algorithm for low latency
-SO_KEEPALIVE: TCP keepalive for connection monitoring
-Buffer Tuning: 16MB buffers (8MB on macOS) for high throughput
-Compression: zlib compression for large payloads
+---
 
-🎓 Examples
-Custom Data Loader Integration
-pythonfrom torch.utils.data import DataLoader
+## 🎓 Examples
+
+### Custom Data Loader Integration
+```python
+from torch.utils.data import DataLoader
 from guava import Orchestrator, DistributedConfig
 import torch.nn as nn
 
-# Your custom dataset
 dataset = YourDataset(...)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-# Use with orchestrator
 orchestrator = Orchestrator(config)
 orchestrator.register_model(model)
 orchestrator.start_training(dataloader, num_epochs=10)
-Custom Model Integration
-pythonfrom guava import DistributedConfig, Orchestrator
+```
+
+### Custom Model Integration
+```python
+from guava import DistributedConfig, Orchestrator
 import torch.nn as nn
 
 class MyCustomModel(nn.Module):
@@ -252,107 +286,110 @@ class MyCustomModel(nn.Module):
         # Your architecture
        
     def forward(self, x):
-        # Your forward pass
         return output
 
-# Register with framework
 model = MyCustomModel()
 config = DistributedConfig(...)
 orchestrator = Orchestrator(config)
 orchestrator.register_model(model)
-Multi-Node Cluster Setup
-Setup script for worker nodes:
-bash#!/bin/bash
+```
+
+### Multi-Node Cluster Setup
+```bash
+#!/bin/bash
 # launch_worker.sh
-export CUDA_VISIBLE_DEVICES=0,1 # GPUs to use
+export CUDA_VISIBLE_DEVICES=0,1
 export MASTER_IP=192.168.1.100
 export MASTER_PORT=29500
 python -m guava.network_worker \
     --gpu-id 0 \
     --master-ip $MASTER_IP \
     --master-port $MASTER_PORT
-📊 Performance Tips
+```
 
-Choose the Right Parallelism Strategy
+---
 
-Small models, multiple GPUs: Data parallelism
-Large models, limited memory: Model parallelism
-Very large models: Pipeline + model parallelism
-Within-node optimization: Tensor parallelism
+## 📊 Performance Tips
 
+### Choose the Right Parallelism Strategy
+- Small models → **Data parallelism**  
+- Large models → **Model parallelism**  
+- Very large models → **Pipeline + model parallelism**  
+- Within-node → **Tensor parallelism**
 
-Network Optimization
+### Network Optimization
+- Use InfiniBand / 10GbE+  
+- Keep orchestrator near workers  
+- Use compression for slower networks  
 
-Use high-bandwidth interconnect (InfiniBand, 10GbE+)
-Place orchestrator on fastest node or run it centrally in the same rack
-Minimize cross-datacenter training
-Use compression for slow networks
-
-
-Memory Management
-
-python# Enable gradient checkpointing / mixed precision
+### Memory Management
+```python
 config = DistributedConfig(
-    use_amp=True, # Mixed precision training
-    max_grad_norm=1.0, # Gradient clipping
+    use_amp=True,
+    max_grad_norm=1.0,
 )
+```
+*(Optional)*: `orchestrator.enable_memory_profiling()`
 
-# (Optional) expose memory reporting in orchestrator
-# orchestrator.enable_memory_profiling()
-
-Batch Size Tuning
-
-python# Effective batch size in data parallelism
+### Batch Size Tuning
+```python
 effective_batch_size = config.batch_size * config.num_workers
-
-# For pipeline parallelism
+# or with pipeline parallelism
 effective_batch_size = config.batch_size * config.micro_batches
-🐛 Troubleshooting
-Connection Issues
-python# Increase timeouts
-config.activation_timeout = 120.0 # seconds
-config.ack_timeout = 60.0 # seconds
+```
 
-# Enable retries
+---
+
+## 🐛 Troubleshooting
+
+### Connection Issues
+```python
+config.activation_timeout = 120.0
+config.ack_timeout = 60.0
 config.max_resends = 5
 config.resend_probe_interval = 10.0
-CUDA Out of Memory
-python# Reduce batch size
+```
+
+### CUDA Out of Memory
+```python
 config.batch_size = 8
-
-# Use mixed precision
 config.use_amp = True
+```
 
-# You can also shorten sequence length if you're training a transformer
-Network Bottlenecks
-bash# Monitor network usage
-nload # or
+### Network Bottlenecks
+```bash
+nload
 iftop
-
-# Check socket buffer settings
 sysctl net.core.rmem_max
 sysctl net.core.wmem_max
-🤝 Contributing
-Contributions are welcome! Please:
+```
 
-Fork the repository
-Create a feature branch
-Add tests for new functionality
-Submit a pull request
+---
 
-📄 License
-MIT License - see LICENSE file for details
-🙏 Acknowledgments
+## 🤝 Contributing
+1. Fork the repository  
+2. Create a feature branch  
+3. Add tests  
+4. Submit a pull request  
+
+---
+
+## 📄 License
+MIT License — see `LICENSE` file for details.
+
+---
+
+## 🙏 Acknowledgments
 Built on top of:
+- PyTorch  
+- Modern distributed training best practices  
+- Practical networking patterns  
 
-PyTorch for deep learning primitives
-Modern distributed training best practices
-Practical networking patterns (ACK barriers, resend, socket tuning)
+---
 
-📮 Support
+## 📮 Support
+- **Issues:** GitHub Issues  
+- **Documentation:** coming soon  
+- **Discord:** coming soon  
 
-Issues: GitHub Issues
-Documentation: coming soon
-Discord: coming soon
-
-Made with ❤️ for the ML community
+**Made with ❤️ for the ML community**
