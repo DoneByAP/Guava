@@ -101,6 +101,25 @@ class Orchestrator:
             weight_decay=self.cfg.weight_decay,
         )
 
+    def wait_for_workers(
+        self,
+        expected: Optional[int] = None,
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.1,
+    ) -> None:
+        """Block until the orchestrator has registered the expected workers."""
+
+        target = expected if expected is not None else self.cfg.num_workers
+        start_ts = time.time()
+
+        while len(self.registered_workers) < target:
+            if timeout is not None and (time.time() - start_ts) > timeout:
+                raise TimeoutError(
+                    f"Timed out waiting for {target} workers; "
+                    f"only {len(self.registered_workers)} registered"
+                )
+            time.sleep(poll_interval)
+
     def start_training(
         self,
         train_loader: Iterable,
@@ -512,9 +531,10 @@ class Orchestrator:
         assert self.optimizer is not None
 
         # spin until we have grads from everyone
+        expected_workers = max(self.cfg.num_workers, 1)
         while True:
             with self.gradients_lock:
-                ready = len(self.collected_gradients) >= len(self.registered_workers)
+                ready = len(self.collected_gradients) >= expected_workers
             if ready:
                 break
             time.sleep(0.01)
