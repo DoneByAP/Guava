@@ -554,9 +554,12 @@ Workers coordinate via messages like:
 
 ## 🐛 Troubleshooting
 
-> ⚠️ **Note on errors**  
-> GPU error codes can get... funky. A simple restart of just the worker process (or restarting training) often clears a transient CUDA hiccup. You don't always have to dive into a "CUDA unspecified launch failure" unless it keeps coming back.
-
+>  **A Devs Note on Errors**
+> 
+> Honestly, GPU error codes can get a little funky in my opinion.  
+> In your development, consider that a lot of the time during training (and sometimes inference),  
+> a simple restart is all that’s needed and you’ll progress until the next error.
+>   
 ### Worker never registers
 - Confirm the worker box can reach `master_ip:master_port+0`.
 - Check firewall / Windows Defender inbound rules.
