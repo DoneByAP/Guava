@@ -174,6 +174,35 @@ class Orchestrator:
 
         print("Training loop finished.")
 
+    def wait_for_workers(
+        self,
+        expected: Optional[int] = None,
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.1,
+    ) -> None:
+        """
+        Block until the orchestrator has registered N workers.
+
+        Args:
+            expected: how many workers we want. Defaults to self.cfg.num_workers.
+            timeout: max seconds to wait (None = wait forever).
+            poll_interval: sleep interval between checks.
+
+        Raises:
+            TimeoutError: if timeout is set and not enough workers connect.
+        """
+        target = expected if expected is not None else self.cfg.num_workers
+        start_ts = time.time()
+
+        while len(self.registered_workers) < target:
+            if timeout is not None and (time.time() - start_ts) > timeout:
+                raise TimeoutError(
+                    f"Timed out waiting for {target} workers; "
+                    f"only {len(self.registered_workers)} registered"
+                )
+            time.sleep(poll_interval)
+
+
     def save_checkpoint(self, path: str) -> None:
         """
         Save orchestrator's version of the model.
@@ -503,28 +532,30 @@ class Orchestrator:
 
     def _aggregate_and_step(self) -> None:
         """
-        Wait until we have gradients from ALL active workers,
+        Wait until we have gradients from ALL expected workers,
         average them, apply to our master model, step optimizer.
 
-        NOTE: This is synchronous data-parallel style.
+        Sync-style data parallel.
         """
         assert self.model is not None
         assert self.optimizer is not None
 
-        # spin until we have grads from everyone
+        expected_workers = max(self.cfg.num_workers, 1)
+
+        # wait until we've heard from everyone
         while True:
             with self.gradients_lock:
-                ready = len(self.collected_gradients) >= len(self.registered_workers)
+                ready = len(self.collected_gradients) >= expected_workers
             if ready:
                 break
             time.sleep(0.01)
 
-        # collect then clear
+        # grab and clear
         with self.gradients_lock:
             per_gpu_grads = self.collected_gradients
             self.collected_gradients = {}
 
-        # param_name -> list[tensor_from_each_gpu]
+        # group grads by param name
         stacked: Dict[str, List[torch.Tensor]] = {}
         for gpu_id, grad_dict in per_gpu_grads.items():
             for name, g in grad_dict.items():
@@ -535,22 +566,14 @@ class Orchestrator:
         for name, lst in stacked.items():
             avg_grads[name] = torch.stack(lst).mean(dim=0)
 
-        # load averaged grads into our reference model, then step
+        # load averaged grads into master model and step
         self.optimizer.zero_grad(set_to_none=True)
         for (name, param) in self.model.named_parameters():
             if name in avg_grads:
                 param.grad = avg_grads[name].to(param.device).clone()
-            else:
-                param.grad = torch.zeros_like(param)
-
-        # gradient clipping
-        if self.cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.max_grad_norm
-            )
 
         self.optimizer.step()
+
 
     def _drain_metrics(self) -> List[Dict[str, Any]]:
         """Return and clear collected metrics."""
