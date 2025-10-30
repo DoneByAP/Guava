@@ -1,28 +1,104 @@
 """
 Base worker interface for distributed training.
+Adds optional Tensor Parallel helpers (no-ops unless a tp_adapter is set).
 """
 
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Protocol
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class BaseWorker(ABC):
+# -----------------------------------------------------------------------------
+# Tensor Parallel adapter + mixin
+# -----------------------------------------------------------------------------
+
+class TensorParallelAdapter(Protocol):
+    """
+    Adapter interface that performs the actual collectives over the network.
+    Implementations should provide:
+      - gather(local_tensor, step) -> full_tensor
+      - reduce(local_grad, step) -> averaged_grad
+    In your codebase, NetworkWorker owns the control socket and can pass an
+    object implementing this interface into BaseWorker.
+    """
+    def gather(self, local_tensor: torch.Tensor, step: int) -> torch.Tensor: ...
+    def reduce(self, local_grad: torch.Tensor, step: int) -> torch.Tensor: ...
+
+
+class _NoOpTPAdapter:
+    """Default TP adapter that simply no-ops."""
+    def gather(self, local_tensor: torch.Tensor, step: int) -> torch.Tensor:
+        return local_tensor
+    def reduce(self, local_grad: torch.Tensor, step: int) -> torch.Tensor:
+        return local_grad
+
+
+class TensorParallelMixin:
+    """
+    Shared tensor-parallel utilities for splitting/gathering/reducing tensors.
+    These are safe no-ops unless a real tp_adapter is provided AND
+    config.enable_tensor_parallel is True.
+    """
+
+    def _tp_enabled(self) -> bool:
+        return bool(
+            getattr(self.config, "enable_tensor_parallel", False)
+            and getattr(self.config, "tensor_parallel_size", 1) > 1
+        )
+
+    def tensor_split(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """
+        Return local shard of a tensor along `dim`. This is a convenience helper
+        you can use in custom layers or glue code if you pre-construct full tensors.
+        """
+        if not self._tp_enabled():
+            return tensor
+        tp_size = int(getattr(self.config, "tensor_parallel_size", 1) or 1)
+        rank = int(getattr(self, "tensor_rank", 0))
+        chunks = torch.chunk(tensor, tp_size, dim=dim)
+        return chunks[rank].contiguous()
+
+    def tensor_gather(self, local_tensor: torch.Tensor, step: int) -> torch.Tensor:
+        """
+        All-gather partial outputs across tensor peers to build the full activation.
+        Delegates to tp_adapter if TP is enabled, else returns the input.
+        """
+        if not self._tp_enabled():
+            return local_tensor
+        return self.tp_adapter.gather(local_tensor, step)
+
+    def tensor_reduce_grad(self, local_grad: Optional[torch.Tensor], step: int) -> Optional[torch.Tensor]:
+        """
+        All-reduce (average) gradients across tensor peers.
+        Delegates to tp_adapter if TP is enabled, else returns the input.
+        """
+        if local_grad is None or not self._tp_enabled():
+            return local_grad
+        return self.tp_adapter.reduce(local_grad, step)
+
+
+# -----------------------------------------------------------------------------
+# Base + concrete workers
+# -----------------------------------------------------------------------------
+
+class BaseWorker(TensorParallelMixin, ABC):
     """
     Abstract base class for distributed training workers.
     Each worker sits on a specific GPU, holds either a full model (data parallel)
     or a slice of the model (model parallel), and talks to the orchestrator.
     """
 
-    def __init__(self, gpu_id: int, config: Any):
+    def __init__(self, gpu_id: int, config: Any, tp_adapter: Optional[TensorParallelAdapter] = None):
         """
         Args:
             gpu_id: which local CUDA device this worker should use
             config: DistributedConfig (learning rate, clip norm, etc.)
+            tp_adapter: Optional adapter implementing tensor-parallel collectives.
+                        If None, TP helpers become safe no-ops.
         """
         self.gpu_id = gpu_id
         self.config = config
@@ -32,13 +108,23 @@ class BaseWorker(ABC):
         self.optimizer: torch.optim.Optimizer = None
         self.is_training: bool = False
 
+        # TP plumbing
+        self.tp_adapter: TensorParallelAdapter = tp_adapter or _NoOpTPAdapter()
+        tp_size = int(getattr(self.config, "tensor_parallel_size", 1) or 1)
+        self.tensor_rank: int = (gpu_id % tp_size) if tp_size > 0 else 0
+
         # Cached tensors from last forward() so backward() can use them.
         # For model-parallel shard: we cache activations we output.
         # For data-parallel replica: we cache logits we produced.
         self._last_activation: torch.Tensor = None
         self._last_output: torch.Tensor = None
 
-        logger.info(f"Worker {gpu_id}: Initialized on {self.device}")
+        logger.info(
+            f"Worker {gpu_id}: Initialized on {self.device} "
+            f"(TP enabled={getattr(self.config, 'enable_tensor_parallel', False)}, "
+            f"tp_size={getattr(self.config, 'tensor_parallel_size', 1)}, "
+            f"tp_rank={self.tensor_rank})"
+        )
 
     @abstractmethod
     def register_model(self, model: nn.Module) -> None:
@@ -46,7 +132,7 @@ class BaseWorker(ABC):
         Give this worker its model or model shard, move to device,
         and create the optimizer for JUST those params.
         """
-        pass
+        ...
 
     @abstractmethod
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -54,7 +140,7 @@ class BaseWorker(ABC):
         Run forward pass on this worker's model (or shard).
         Must also cache the relevant tensor so backward() can run later.
         """
-        pass
+        ...
 
     @abstractmethod
     def backward(self, grad_output: torch.Tensor) -> torch.Tensor:
@@ -69,7 +155,7 @@ class BaseWorker(ABC):
             we backprop into our cached activation and return grad_input
             so the previous shard can keep going.
         """
-        pass
+        ...
 
     def update_weights(self) -> None:
         """One optimizer step + zero_grad()."""
@@ -121,15 +207,16 @@ class ModelShardWorker(BaseWorker):
       and returns dLoss/dPrevActivation upstream
     """
 
-    def __init__(self, gpu_id: int, config: Any, layer_start: int, layer_end: int):
+    def __init__(self, gpu_id: int, config: Any, layer_start: int, layer_end: int, tp_adapter: Optional[TensorParallelAdapter] = None):
         """
         Args:
             gpu_id: GPU index on this machine
             config: DistributedConfig
             layer_start: inclusive global layer index this shard starts at
             layer_end:   exclusive global layer index this shard ends at
+            tp_adapter: optional TP adapter for gather/reduce collectives
         """
-        super().__init__(gpu_id, config)
+        super().__init__(gpu_id, config, tp_adapter=tp_adapter)
         self.layer_start = layer_start
         self.layer_end = layer_end
         self.num_layers = layer_end - layer_start
@@ -157,6 +244,9 @@ class ModelShardWorker(BaseWorker):
         """
         Forward through this shard and cache the activation so we
         can later run backward() when orchestrator sends gradients.
+
+        NOTE: If you implement true intra-layer tensor splitting INSIDE layers,
+        call self.tensor_split/tensor_gather around those layer ops.
         """
         x = x.to(self.device, non_blocking=True)
 
@@ -164,8 +254,6 @@ class ModelShardWorker(BaseWorker):
             out = self.model(x, *args, **kwargs)
 
         # Cache activation for pipeline backward.
-        # We must keep grad so that when the NEXT shard gives us dLoss/dOut,
-        # we can call backward() here and then read grad_input.
         self._last_activation = out
         if self.is_training and isinstance(out, torch.Tensor):
             self._last_activation.retain_grad()
@@ -184,14 +272,18 @@ class ModelShardWorker(BaseWorker):
 
         grad_output = grad_output.to(self.device, non_blocking=True)
 
-        # Run backward from cached activation
+        # Backprop from cached activation
         self._last_activation.backward(grad_output)
 
-        # Now the grad of the input to this shard lives on self._last_activation.grad
-        # but we need the gradient for the *input that originally came into this shard*.
-        # After .backward(), PyTorch populated .grad on _last_activation's source.
-        grad_input = self._last_activation.grad
+        # If doing tensor-parallel inside this shard's layers, you may
+        # optionally reduce grads here per-parameter (NetworkWorker currently
+        # handles this after loss.backward()):
 
+        # for p in self.model.parameters():
+        #     if p.grad is not None:
+        #         p.grad = self.tensor_reduce_grad(p.grad, step=<provide step>)
+
+        grad_input = self._last_activation.grad
         return grad_input
 
 
@@ -203,8 +295,8 @@ class DataParallelWorker(BaseWorker):
     - Gives gradients to orchestrator for averaging across replicas
     """
 
-    def __init__(self, gpu_id: int, config: Any):
-        super().__init__(gpu_id, config)
+    def __init__(self, gpu_id: int, config: Any, tp_adapter: Optional[TensorParallelAdapter] = None):
+        super().__init__(gpu_id, config, tp_adapter=tp_adapter)
 
     def register_model(self, model: nn.Module) -> None:
         """
@@ -226,13 +318,15 @@ class DataParallelWorker(BaseWorker):
         We also cache the output logits so:
         - compute_loss_and_backward() can reuse them
         - backward() can apply external gradients if orchestrator sends grad_output
+
+        NOTE: If you add true intra-layer TP here, call tensor_split/tensor_gather
+        inside your module implementation. At this level we expose helpers only.
         """
         x = x.to(self.device, non_blocking=True)
 
         with torch.set_grad_enabled(self.is_training):
             out = self.model(x, *args, **kwargs)
 
-        # Cache logits/outputs for potential backward() calls
         self._last_output = out
         if self.is_training and isinstance(out, torch.Tensor):
             self._last_output.retain_grad()
@@ -254,7 +348,7 @@ class DataParallelWorker(BaseWorker):
         self._last_output.backward(grad_output)
 
         # Clip after backward, before step.
-        if self.config.max_grad_norm > 0:
+        if getattr(self.config, "max_grad_norm", 0) > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.max_grad_norm
             )
@@ -266,6 +360,9 @@ class DataParallelWorker(BaseWorker):
         - backward()
         - clip gradients
         Returns scalar loss for logging.
+
+        If you want TP grad-all-reduce per-parameter here, do it in the caller
+        (e.g., NetworkWorker) by iterating params and calling tensor_reduce_grad.
         """
         labels = labels.to(self.device, non_blocking=True)
 
@@ -275,7 +372,7 @@ class DataParallelWorker(BaseWorker):
         if self.is_training:
             loss.backward()
 
-            if self.config.max_grad_norm > 0:
+            if getattr(self.config, "max_grad_norm", 0) > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.max_grad_norm
@@ -313,6 +410,9 @@ class DataParallelWorker(BaseWorker):
             if param.grad is None:
                 continue  # nothing to average into
 
-            stacked = torch.stack([worker_grads[i].to(self.device) for worker_grads in all_gradients], dim=0)
+            stacked = torch.stack(
+                [worker_grads[i].to(self.device) for worker_grads in all_gradients],
+                dim=0
+            )
             avg_grad = stacked.mean(dim=0)
             param.grad.copy_(avg_grad)
