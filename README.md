@@ -50,9 +50,53 @@ pip install -e .
 ```
 
 ### Requirements
-- Python >= 3.8
-- PyTorch >= 2.0.0
+
+- Python >= 3.8  
+- PyTorch >= 2.0.0  
 - CUDA-capable GPUs (for GPU training)
+
+---
+
+## 🖥 GPU Worker Setup (CUDA on Linux)
+
+Every GPU worker box needs:
+1. An NVIDIA GPU
+2. NVIDIA drivers for that GPU
+3. CUDA toolkit (gives you `nvcc`, CUDA runtime, etc.)
+4. PyTorch built/installed with CUDA support
+
+You can download CUDA directly from NVIDIA here:
+https://developer.nvidia.com/cuda-downloads
+
+Below is a typical Ubuntu install flow for CUDA Toolkit using NVIDIA's apt repo.  
+(This is an example; adjust the Ubuntu version in the URL if you're not on this release.)
+
+```bash
+# 1. (Recommended) Update packages
+sudo apt-get update
+sudo apt-get install -y wget gnupg
+
+# 2. Add NVIDIA's CUDA repo keyring (example for Ubuntu 22.04 / x86_64)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+
+# 3. Install CUDA toolkit
+sudo apt-get -y install cuda-toolkit
+
+# 4. (Optional) Add CUDA to PATH for this shell
+echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# 5. Verify (should print CUDA compiler version)
+nvcc --version
+```
+
+Notes:
+- You don't have to install the full CUDA *driver* from this script if your driver is already installed via your distro or vendor.
+- `cuda-toolkit` gives you user-space CUDA libs that PyTorch will use.
+- All worker nodes must be on compatible driver / CUDA so math kernels behave the same.
 
 ---
 
@@ -63,10 +107,10 @@ Guava includes two launch scripts that demonstrate orchestrated data-parallel tr
 ### 1. Launch the Orchestrator
 
 ```bash
-python orchestrator_train.py     --master-ip <<DEVICE-IP-ADDRESS>>     --master-port 29500     --gpus 2     --train-batches 100     --val-interval 20
+python orchestrator_train.py     --master-ip 0.0.0.0     --master-port 29500     --gpus 2     --train-batches 100     --val-interval 20
 ```
 
-What this does:
+Key behaviors:
 - Builds the same `TinyToyModel` used on the workers
 - Constructs a `DistributedConfig` mirroring worker hyperparameters
 - Generates deterministic toy batches and labels
@@ -79,17 +123,17 @@ What this does:
 Run this once per machine that contributes GPUs. The script spawns a `NetworkWorker` thread for each GPU ID you provide.
 
 ```bash
-python guava_worker.py     --gpu-ids 0,1     --master-ip <<Orchestrator-IP-ADDRESS>>     --master-port 29500     --world-size 2
+python guava_worker.py     --gpu-ids 0,1     --master-ip 192.168.0.177     --master-port 29500     --world-size 2
 ```
 
-Each worker host will:
-- Parse the comma-separated `--gpu-ids` list (e.g. `"0,1"`)
-- Build a `DistributedConfig` that mirrors the orchestrator
-- Construct a per-thread `TinyToyModel` factory to keep parameters aligned
-- Start a `NetworkWorker` thread per GPU that calls `connect_and_train()`
-- Block until all threads exit
+What happens on each worker host:
+- Parses the comma-separated `--gpu-ids` list (e.g. "0,1")
+- Builds a `DistributedConfig` that mirrors the orchestrator
+- Constructs a per-thread `TinyToyModel` factory to keep parameters aligned
+- Starts a `NetworkWorker` thread per GPU that calls `connect_and_train()`
+- Blocks the main process until all worker threads exit
 
-⚠ Important: `batch_size`, `vocab_size`, `d_model`, `n_layers`, and `n_heads` must match across orchestrator and workers. You are responsible for keeping them aligned.
+> **Config parity is critical** — `batch_size`, `vocab_size`, `d_model`, `n_layers`, and `n_heads` must match across the orchestrator and all workers.
 
 ### 3. Monitor Training
 
@@ -98,9 +142,7 @@ Both scripts print detailed startup banners so you can confirm:
 - Each worker reports the correct CUDA device and world size
 - Workers successfully register before the orchestrator begins training
 
-When training finishes:
-- The orchestrator writes `orchestrator_final.pt` to the checkpoint dir
-- Workers shut down cleanly
+When training finishes, the orchestrator stores `orchestrator_final.pt` in the configured checkpoint directory and all worker threads shut down cleanly.
 
 ---
 
@@ -122,16 +164,14 @@ orch.start_training(
     val_interval=max(args.val_interval, 1),
 )
 
-orch.save_checkpoint(f"{cfg.checkpoint_dir}/orchestrator_final.pt")
+orch.save_checkpoint(f"{cfg.checkpoint_dir}/orchestrator_final.pt}")
 ```
 
-CLI flags (orchestrator):
-- `--gpus`: how many total workers you expect
-- `--train-batches`: number of fake batches per epoch
-- `--val-interval`: run validation every N steps (0 turns off val)
-- `--worker-timeout`: how long to wait for workers to show up
-
----
+CLI flags you'll care about:
+- `--gpus`: total worker count the orchestrator expects
+- `--train-batches`: number of toy batches per epoch
+- `--val-interval`: run validation every N steps (0 disables validation)
+- `--worker-timeout`: optional timeout while waiting for workers to register
 
 ### `guava_worker.py`
 
@@ -146,10 +186,10 @@ runtime = NetworkWorker(
 runtime.connect_and_train()
 ```
 
-CLI flags (worker):
+CLI flags you'll care about:
 - `--gpu-ids`: comma-separated list of local CUDA device indices
 - `--world-size`: total number of workers across all machines
-- `--batch-size`, `--vocab-size`, `--d-model`, `--n-layers`, `--n-heads`: must match orchestrator
+- `--batch-size`, `--vocab-size`, `--d-model`, `--n-layers`, `--n-heads`: must match the orchestrator
 
 ---
 
@@ -220,22 +260,23 @@ guava/
 
 ### Communication Protocol
 
-Message framing:
+The framework uses a length-prefixed message protocol:
+
 ```text
 [4 bytes: length] [N bytes: compressed pickled data]
 ```
 
 **Message Types:**
-- Control: `HELLO`, `READY`, `START_TRAINING`, `STOP_TRAINING`, `HEARTBEAT`
-- Data: `BATCH_DATA`, `ACTIVATIONS`, `GRADIENTS`, `LABELS`
-- Model: `MODEL_CONFIG`, `MODEL_WEIGHTS`, `MODEL_UPDATE`
-- Metrics: `LOSS`, `METRICS`
+- Control: HELLO, READY, START_TRAINING, STOP_TRAINING, HEARTBEAT
+- Data: BATCH_DATA, ACTIVATIONS, GRADIENTS, LABELS
+- Model: MODEL_CONFIG, MODEL_WEIGHTS, MODEL_UPDATE
+- Metrics: LOSS, METRICS
 
-**Socket tuning:**
-- `TCP_NODELAY`
-- `SO_KEEPALIVE`
-- Large socket buffers (16MB, 8MB on macOS)
-- `zlib` compression for payloads
+**Socket Optimizations:**
+- TCP_NODELAY
+- SO_KEEPALIVE
+- 16MB buffers (8MB on macOS)
+- zlib compression
 
 ---
 
@@ -249,7 +290,7 @@ Message framing:
 
 ### Network Optimization
 - Use InfiniBand / 10GbE+
-- Keep the orchestrator near the workers
+- Keep the orchestrator near workers
 - Use compression for slower networks
 
 ### Memory Management
@@ -261,7 +302,7 @@ config = DistributedConfig(
 )
 ```
 
-*Optional:* `orchestrator.enable_memory_profiling()`
+*Optional*: `orchestrator.enable_memory_profiling()`
 
 ### Batch Size Tuning
 
@@ -275,7 +316,9 @@ effective_batch_size = cfg.batch_size * cfg.num_workers
 
 > **A Dev's Note on Errors**
 >
-> GPU error codes can get weird. During training (and sometimes inference), a simple restart often clears transient issues. Don't waste a night chasing ghosts unless it keeps happening.
+> GPU error codes can get funky. During training (and sometimes inference),
+> a simple restart often clears transient issues. Don't hunt down obscure
+> computational or memory errors until you absolutely have to.
 
 ### Connection Issues
 
@@ -306,31 +349,29 @@ sysctl net.core.wmem_max
 
 ## 🤝 Contributing
 
-1. Fork the repo  
+1. Fork the repository  
 2. Create a feature branch  
 3. Add tests  
-4. Open a PR  
+4. Submit a pull request  
 
 ---
 
 ## 🪪 License
 
-Guava is licensed under a dual model:
+Guava is licensed under a dual license model:
 
-- **Community Edition:** Apache 2.0.  
-  You can use, modify, and ship it for personal, research, or non-commercial work.
+- **Community Edition:** Apache License 2.0. You can use, modify, and distribute it for personal, research, or non‑commercial work.
+- **Commercial Edition:** A commercial license is required for organizations or products that integrate Guava into a paid offering or provide Guava-based services (managed GPU clusters, training-as-a-service, etc.).
 
-- **Commercial Edition:** A commercial license is required for companies or products that integrate Guava into something paid (for example: managed GPU training, orchestration as a service, etc).
-
-For commercial licensing inquiries:
+For commercial licensing inquiries, contact:  
 📧 azanipeterking@gmail.com
 
 ---
 
 ## 📮 Support
 
-- Issues: GitHub Issues  
-- Docs: coming soon  
-- Discord: coming soon  
+- **Issues:** GitHub Issues  
+- **Documentation:** coming soon  
+- **Discord:** coming soon  
 
 **Made with ❤️ for the ML community**
