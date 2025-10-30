@@ -17,8 +17,8 @@ This README describes the current state of the pip module you just saw:
 - `protocol.py`
 - `socket_utils.py`
 - `__init__.py`
-- `orchestrator_train.py` (CLI entrypoint for the orchestrator)
-- `guava_worker.py` (CLI entrypoint for GPU workers)
+- `orchestrator_train.py` (Example CLI entrypoint for the orchestrator )
+- `guava_worker.py` (Example CLI entrypoint for GPU workers)
 
 ---
 
