@@ -342,15 +342,14 @@ effective_batch_size = config.batch_size * config.micro_batches
 
 ## 🐛 Troubleshooting
 
-### ⚠️ A Devs Note on Errors
-<div style="background: #fff8dc; border-left: 5px solid #ffcc00; padding: 12px 16px; border-radius: 6px; box-shadow: 0 0 12px rgba(255, 204, 0, 0.4);">
+> ⚠️ **Note on Error**
+> 
+> 🟨 Honestly, GPU error codes can get a little funky in my opinion.  
+> In your development, consider that a lot of the time during training (and sometimes inference),  
+> a simple restart is all that’s needed and you’ll progress until the next error.  
+> Obscure computational or memory errors lurk — you don’t always need to hunt them down  
+> until you absolutely have to.
 
-<b>Honestly, GPU error codes can get a little funky in my opinion.</b><br><br>
-In your development, consider that a lot of the time during training (and sometimes inference),  
-a simple restart is all that’s needed and you’ll progress until the next error.<br><br>
-Obscure computational or memory errors lurk — you don’t always need to hunt them down  
-until you absolutely have to.
-</div>
 
 ### Connection Issues
 ```python
