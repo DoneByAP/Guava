@@ -63,7 +63,7 @@ Guava includes two launch scripts that demonstrate orchestrated data-parallel tr
 ### 1. Launch the Orchestrator
 
 ```bash
-python orchestrator_train.py     --master-ip 0.0.0.0     --master-port 29500     --gpus 2     --train-batches 100     --val-interval 20
+python orchestrator_train.py     --master-ip <<DEVICE-IP-ADDRESS>>     --master-port 29500     --gpus 2     --train-batches 100     --val-interval 20
 ```
 
 What this does:
@@ -79,7 +79,7 @@ What this does:
 Run this once per machine that contributes GPUs. The script spawns a `NetworkWorker` thread for each GPU ID you provide.
 
 ```bash
-python guava_worker.py     --gpu-ids 0,1     --master-ip 192.168.0.177     --master-port 29500     --world-size 2
+python guava_worker.py     --gpu-ids 0,1     --master-ip <<Orchestrator-IP-ADDRESS>>     --master-port 29500     --world-size 2
 ```
 
 Each worker host will:
