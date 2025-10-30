@@ -554,7 +554,7 @@ Workers coordinate via messages like:
 
 ## 🐛 Troubleshooting
 
->  **A Devs Note on Errors**
+>  **A Dev's Note on Errors**
 > 
 > Honestly, GPU error codes can get a little funky in my opinion.  
 > In your development, consider that a lot of the time during training (and sometimes inference),  
