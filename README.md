@@ -2,36 +2,36 @@
 
 **Distributed Neural Network Training Over Network**
 
-A modular, pip-installable framework for distributed deep learning training across multiple GPUs and machines. Built for flexibility, performance, and ease of use.
+Guava is a modular framework for orchestrating distributed PyTorch training across multiple GPUs and machines. It ships with ready-to-run orchestration and worker scripts that make it easy to spin up a tiny end-to-end demo or adapt the infrastructure to your own model.
 
 ---
 
 ## 🚀 Features
 
 ### Multiple Parallelism Strategies
-- **Data Parallelism:** Train on different batches across GPUs  
-- **Model Parallelism:** Split model layers across GPUs  
-- **Pipeline Parallelism:** Micro-batch pipelining for efficiency  
-- **Tensor Parallelism:** Split tensors within layers (single-node)  
-- **Hybrid Parallelism:** Combine strategies for maximum scalability  
+- **Data Parallelism:** Train on different batches across GPUs
+- **Model Parallelism:** Split model layers across GPUs
+- **Pipeline Parallelism:** Micro-batch pipelining for efficiency
+- **Tensor Parallelism:** Split tensors within layers (single-node)
+- **Hybrid Parallelism:** Combine strategies for maximum scalability
 
 ### Network-Optimized Communication
-- Optimized socket configurations for low latency and high throughput  
-- Automatic compression and serialization  
-- Robust error handling and recovery  
-- TCP keepalive and buffer tuning  
+- Tuned socket options for low latency and high throughput
+- Automatic compression and serialization
+- Robust error handling and reconnection logic
+- TCP keepalive and buffer tuning
 
 ### Flexible Architecture
-- Easy integration with any PyTorch model  
-- Support for custom data loaders  
-- Checkpoint and resume capabilities  
-- Comprehensive logging and metrics  
+- Works with any PyTorch `nn.Module`
+- Supports custom data loaders and datasets
+- Checkpoint and resume capabilities
+- Comprehensive logging and metrics hooks
 
 ### Runtime Behavior
-- Automatic reconnection on failures  
-- CUDA error recovery  
-- Memory management  
-- Progress tracking with tqdm  
+- Automatic reconnection on failures
+- CUDA error recovery helpers
+- Graceful shutdown handling
+- Progress tracking with tqdm
 
 ---
 
@@ -50,116 +50,113 @@ pip install -e .
 ```
 
 ### Requirements
-- Python >= 3.8  
-- PyTorch >= 2.0.0  
+- Python >= 3.8
+- PyTorch >= 2.0.0
 - CUDA-capable GPUs (for GPU training)
 
 ---
 
-## 🎯 Quick Start
+## 🎯 Quick Start (TinyToyModel Demo)
 
-### 1. Single Machine, Multiple GPUs (Data Parallel)
-```python
-from guava import DistributedConfig, Orchestrator
-import torch
-import torch.nn as nn
+Guava includes two launch scripts that demonstrate orchestrated data-parallel training with a minimal `TinyToyModel`. Launch the orchestrator on the control node (CPU is fine), then connect one or more GPU workers.
 
-# Your model
-class MyTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead=8),
-            num_layers=6
-        )
-        self.output = nn.Linear(d_model, vocab_size)
-   
-    def forward(self, x):
-        x = self.embedding(x)
-        x = self.transformer(x)
-        return self.output(x)
+### 1. Launch the Orchestrator
 
-# Configure distributed training
-config = DistributedConfig(
-    vocab_size=50000,
-    d_model=512,
-    batch_size=32,
-    data_parallel=True, # Use data parallelism
-    num_workers=torch.cuda.device_count()
-)
-
-# Create orchestrator
-orchestrator = Orchestrator(config)
-
-# Register your model
-model = MyTransformer(config.vocab_size, config.d_model)
-orchestrator.register_model(model)
-
-# Start training
-orchestrator.start_training(your_dataloader, num_epochs=10)
+```bash
+python orchestrator_train.py     --master-ip 0.0.0.0     --master-port 29500     --gpus 2     --train-batches 100     --val-interval 20
 ```
 
-### 2. Multi-Machine Training (Distributed)
+What this does:
+- Builds the same `TinyToyModel` used on the workers
+- Constructs a `DistributedConfig` mirroring worker hyperparameters
+- Generates deterministic toy batches and labels
+- Waits for workers to register before starting the training loop
+- Periodically runs validation if `--val-interval` > 0
+- Saves a checkpoint to `--checkpoint-dir` when training completes
 
-**On Orchestrator Node:**
-```python
-from guava import DistributedConfig, Orchestrator
+### 2. Launch GPU Workers
 
-config = DistributedConfig(
-    vocab_size=50000,
-    d_model=512,
-    num_workers=4, # Total GPUs across all machines
-    master_ip="192.168.1.100",
-    master_port=29500,
-    data_parallel=True
-)
+Run this once per machine that contributes GPUs. The script spawns a `NetworkWorker` thread for each GPU ID you provide.
 
-orchestrator = Orchestrator(config, mode='orchestrator')
-orchestrator.register_model(model)
-orchestrator.start_training(dataloader, num_epochs=10)
+```bash
+python guava_worker.py     --gpu-ids 0,1     --master-ip 192.168.0.177     --master-port 29500     --world-size 2
 ```
 
-**On Worker Nodes:**
+Each worker host will:
+- Parse the comma-separated `--gpu-ids` list (e.g. `"0,1"`)
+- Build a `DistributedConfig` that mirrors the orchestrator
+- Construct a per-thread `TinyToyModel` factory to keep parameters aligned
+- Start a `NetworkWorker` thread per GPU that calls `connect_and_train()`
+- Block until all threads exit
+
+⚠ Important: `batch_size`, `vocab_size`, `d_model`, `n_layers`, and `n_heads` must match across orchestrator and workers. You are responsible for keeping them aligned.
+
+### 3. Monitor Training
+
+Both scripts print detailed startup banners so you can confirm:
+- The orchestrator is bound to the intended IP/port
+- Each worker reports the correct CUDA device and world size
+- Workers successfully register before the orchestrator begins training
+
+When training finishes:
+- The orchestrator writes `orchestrator_final.pt` to the checkpoint dir
+- Workers shut down cleanly
+
+---
+
+## 🧩 Script Reference
+
+### `orchestrator_train.py`
+
 ```python
-from guava import NetworkWorker, DistributedConfig
+orch = Orchestrator(cfg)
+model = TinyToyModel(vocab_size=cfg.vocab_size, d_model=cfg.d_model)
 
-config = DistributedConfig.from_env() # Load from environment
+orch.register_model(model)
+orch.wait_for_workers(timeout=args.worker_timeout)
 
-worker = NetworkWorker(
-    gpu_id=0,
-    config=config,
-    model_ctor=lambda: MyTransformer(config.vocab_size, config.d_model),
-    master_ip="192.168.1.100",
-    master_port=29500
+orch.start_training(
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=args.epochs,
+    val_interval=max(args.val_interval, 1),
 )
-worker.connect_and_train()
+
+orch.save_checkpoint(f"{cfg.checkpoint_dir}/orchestrator_final.pt")
 ```
 
-### 3. Model Parallelism (Large Models)
+CLI flags (orchestrator):
+- `--gpus`: how many total workers you expect
+- `--train-batches`: number of fake batches per epoch
+- `--val-interval`: run validation every N steps (0 turns off val)
+- `--worker-timeout`: how long to wait for workers to show up
+
+---
+
+### `guava_worker.py`
+
 ```python
-from guava import DistributedConfig, Orchestrator
-
-config = DistributedConfig(
-    vocab_size=50000,
-    d_model=4096,
-    n_layers=48,
-    num_workers=4,
-    model_parallel=True,
-    pipeline_parallel=True,
-    micro_batches=4
+runtime = NetworkWorker(
+    gpu_id=gpu_id,
+    config=cfg,
+    model_ctor=model_ctor,
+    master_ip=master_ip,
+    master_port=master_port,
 )
-
-orchestrator = Orchestrator(config)
-orchestrator.register_model(large_model)
-orchestrator.start_training(dataloader, num_epochs=10)
+runtime.connect_and_train()
 ```
+
+CLI flags (worker):
+- `--gpu-ids`: comma-separated list of local CUDA device indices
+- `--world-size`: total number of workers across all machines
+- `--batch-size`, `--vocab-size`, `--d-model`, `--n-layers`, `--n-heads`: must match orchestrator
 
 ---
 
 ## 🔧 Configuration
 
 ### Environment Variables
+
 ```bash
 # Parallelism Strategy
 export DATA_PARALLEL=1
@@ -188,39 +185,20 @@ export LOG_ACT=0
 ```
 
 ### Configuration Object
+
 ```python
 from guava import DistributedConfig
-import torch
 
-config = DistributedConfig(
-    vocab_size=50257,
-    d_model=768,
-    n_heads=12,
-    n_layers=12,
-    d_ff=3072,
-    max_seq_len=1024,
-    dropout=0.1,
-   
-    batch_size=16,
-    learning_rate=3e-4,
-    weight_decay=0.01,
-    max_grad_norm=1.0,
-    use_amp=False,
-   
-    num_workers=4,
-    master_ip="localhost",
-    master_port=29500,
-   
-    data_parallel=True,
-    model_parallel=False,
-    pipeline_parallel=False,
-    tensor_parallel=False,
-   
-    checkpoint_dir="./checkpoints",
-    save_interval=1000,
-)
-
-config.adapt_to_gpus(torch.cuda.device_count())
+cfg = DistributedConfig()
+cfg.master_ip = args.master_ip
+cfg.master_port = args.master_port
+cfg.num_workers = args.gpus
+cfg.batch_size = args.batch_size
+cfg.vocab_size = args.vocab_size
+cfg.d_model = args.d_model
+cfg.n_layers = args.n_layers
+cfg.n_heads = args.n_heads
+cfg.data_parallel = True
 ```
 
 ---
@@ -228,7 +206,8 @@ config.adapt_to_gpus(torch.cuda.device_count())
 ## 📚 Architecture
 
 ### Component Overview
-```
+
+```text
 guava/
 ├── config.py
 ├── protocol.py
@@ -240,134 +219,82 @@ guava/
 ```
 
 ### Communication Protocol
-The framework uses a length-prefixed message protocol:
-```
+
+Message framing:
+```text
 [4 bytes: length] [N bytes: compressed pickled data]
 ```
 
 **Message Types:**
-- Control: HELLO, READY, START_TRAINING, STOP_TRAINING, HEARTBEAT  
-- Data: BATCH_DATA, ACTIVATIONS, GRADIENTS, LABELS  
-- Model: MODEL_CONFIG, MODEL_WEIGHTS, MODEL_UPDATE  
-- Metrics: LOSS, METRICS  
+- Control: `HELLO`, `READY`, `START_TRAINING`, `STOP_TRAINING`, `HEARTBEAT`
+- Data: `BATCH_DATA`, `ACTIVATIONS`, `GRADIENTS`, `LABELS`
+- Model: `MODEL_CONFIG`, `MODEL_WEIGHTS`, `MODEL_UPDATE`
+- Metrics: `LOSS`, `METRICS`
 
-**Socket Optimizations:**
-- TCP_NODELAY  
-- SO_KEEPALIVE  
-- 16MB buffers (8MB on macOS)  
-- zlib compression  
-
----
-
-## 🎓 Examples
-
-### Custom Data Loader Integration
-```python
-from torch.utils.data import DataLoader
-from guava import Orchestrator, DistributedConfig
-import torch.nn as nn
-
-dataset = YourDataset(...)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-orchestrator = Orchestrator(config)
-orchestrator.register_model(model)
-orchestrator.start_training(dataloader, num_epochs=10)
-```
-
-### Custom Model Integration
-```python
-from guava import DistributedConfig, Orchestrator
-import torch.nn as nn
-
-class MyCustomModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Your architecture
-       
-    def forward(self, x):
-        return output
-
-model = MyCustomModel()
-config = DistributedConfig(...)
-orchestrator = Orchestrator(config)
-orchestrator.register_model(model)
-```
-
-### Multi-Node Cluster Setup
-```bash
-#!/bin/bash
-# launch_worker.sh
-export CUDA_VISIBLE_DEVICES=0,1
-export MASTER_IP=192.168.1.100
-export MASTER_PORT=29500
-python -m guava.network_worker \
-    --gpu-id 0 \
-    --master-ip $MASTER_IP \
-    --master-port $MASTER_PORT
-```
+**Socket tuning:**
+- `TCP_NODELAY`
+- `SO_KEEPALIVE`
+- Large socket buffers (16MB, 8MB on macOS)
+- `zlib` compression for payloads
 
 ---
 
 ## 📊 Performance Tips
 
 ### Choose the Right Parallelism Strategy
-- Small models → **Data parallelism**  
-- Large models → **Model parallelism**  
-- Very large models → **Pipeline + model parallelism**  
+- Small models → **Data parallelism**
+- Large models → **Model parallelism**
+- Very large models → **Pipeline + model parallelism**
 - Within-node → **Tensor parallelism**
 
 ### Network Optimization
-- Use InfiniBand / 10GbE+  
-- Keep orchestrator near workers  
-- Use compression for slower networks  
+- Use InfiniBand / 10GbE+
+- Keep the orchestrator near the workers
+- Use compression for slower networks
 
 ### Memory Management
+
 ```python
 config = DistributedConfig(
     use_amp=True,
     max_grad_norm=1.0,
 )
 ```
-*(Optional)*: `orchestrator.enable_memory_profiling()`
+
+*Optional:* `orchestrator.enable_memory_profiling()`
 
 ### Batch Size Tuning
+
 ```python
-effective_batch_size = config.batch_size * config.num_workers
-# or with pipeline parallelism
-effective_batch_size = config.batch_size * config.micro_batches
+effective_batch_size = cfg.batch_size * cfg.num_workers
 ```
 
 ---
 
 ## 🐛 Troubleshooting
 
->  **A Devs Note on Errors**
-> 
-> Honestly, GPU error codes can get a little funky in my opinion.  
-> In your development, consider that a lot of the time during training (and sometimes inference),  
-> a simple restart is all that’s needed and you’ll progress until the next error.  
-> Obscure computational or memory errors lurk — you don’t always need to hunt them down  
-> until you absolutely have to.
-
-
-
+> **A Dev's Note on Errors**
+>
+> GPU error codes can get weird. During training (and sometimes inference), a simple restart often clears transient issues. Don't waste a night chasing ghosts unless it keeps happening.
 
 ### Connection Issues
+
 ```python
-config.activation_timeout = 120.0
-config.ack_timeout = 60.0
-config.max_resends = 5
-config.resend_probe_interval = 10.0
+cfg.activation_timeout = 120.0
+cfg.ack_timeout = 60.0
+cfg.max_resends = 5
+cfg.resend_probe_interval = 10.0
 ```
 
 ### CUDA Out of Memory
+
 ```python
-config.batch_size = 8
-config.use_amp = True
+cfg.batch_size = 8
+cfg.use_amp = True
 ```
 
 ### Network Bottlenecks
+
 ```bash
 nload
 iftop
@@ -378,39 +305,32 @@ sysctl net.core.wmem_max
 ---
 
 ## 🤝 Contributing
-1. Fork the repository  
+
+1. Fork the repo  
 2. Create a feature branch  
 3. Add tests  
-4. Submit a pull request  
+4. Open a PR  
 
 ---
 
 ## 🪪 License
 
-Guava is licensed under a dual license model:
+Guava is licensed under a dual model:
 
-- **Community Edition:** Licensed under the Apache License 2.0.  
-  You can use, modify, and distribute it freely for personal, research, or non-commercial projects.
+- **Community Edition:** Apache 2.0.  
+  You can use, modify, and ship it for personal, research, or non-commercial work.
 
-- **Commercial Edition:** A commercial license is required for organizations or products that  
-  integrate Guava into a paid offering or provide Guava-based services (e.g. managed GPU clusters, cloud orchestration).
+- **Commercial Edition:** A commercial license is required for companies or products that integrate Guava into something paid (for example: managed GPU training, orchestration as a service, etc).
 
-For commercial licensing inquiries, contact:
+For commercial licensing inquiries:
 📧 azanipeterking@gmail.com
 
 ---
 
-## 🙏 Acknowledgments
-Built on top of:
-- PyTorch  
-- Modern distributed training best practices  
-- Practical networking patterns  
-
----
-
 ## 📮 Support
-- **Issues:** GitHub Issues  
-- **Documentation:** coming soon  
-- **Discord:** coming soon  
+
+- Issues: GitHub Issues  
+- Docs: coming soon  
+- Discord: coming soon  
 
 **Made with ❤️ for the ML community**
