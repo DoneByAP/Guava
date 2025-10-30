@@ -385,8 +385,18 @@ sysctl net.core.wmem_max
 
 ---
 
-## 📄 License
-MIT License — see `LICENSE` file for details.
+## 🪪 License
+
+Guava is licensed under a dual license model:
+
+- **Community Edition:** Licensed under the Apache License 2.0.  
+  You can use, modify, and distribute it freely for personal, research, or non-commercial projects.
+
+- **Commercial Edition:** A commercial license is required for organizations or products that  
+  integrate Guava into a paid offering or provide Guava-based services (e.g. managed GPU clusters, cloud orchestration).
+
+For commercial licensing inquiries, contact:
+📧 azanipeterking@gmail.com
 
 ---
 
