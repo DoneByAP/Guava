@@ -1,13 +1,19 @@
 """
-Communication protocol for distributed training.
+protocol.py
 
-This defines:
-- MessageType: enum of all valid packet "kinds"
-- Message: lightweight container (serializable dict)
-- MessageProtocol: helpers for length-prefixed, compressed, pickle-based socket I/O
-  plus tensor send/receive utilities.
+Canonical message / wire contract for GUAVA distributed training.
 
-All network traffic between orchestrator and workers should go through this.
+Why this exists:
+- Orchestrator <-> Workers talk over multiple TCP ports.
+- We want a consistent schema for:
+    * control commands (start step, phase1, phase2, stop, etc.)
+    * metrics (loss, step)
+    * gradients upload
+    * activation frames (pipeline forward handoff)
+    * tensor-parallel collectives (forward gather / backward reduce)
+
+All control/telemetry goes through a single framing:
+MessageProtocol (length-prefixed, optional zlib, pickle payload).
 """
 
 import struct
@@ -15,80 +21,102 @@ import pickle
 import zlib
 import socket
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 from dataclasses import dataclass
+
+import torch  # used by tensor (un)wrapping helpers
 
 
 class MessageType(Enum):
-    """Message types for distributed training protocol."""
+    """
+    Unified message taxonomy for orchestrator <-> worker communication.
 
-    # --- Control / lifecycle -------------------------------------------------
-    HELLO = "HELLO"                 # worker -> orchestrator: "I'm alive"
-    READY = "READY"                 # worker -> orchestrator: "ready for work"
-    START_TRAINING = "START_TRAINING"
-    STOP_TRAINING = "STOP_TRAINING"
-    SHUTDOWN = "SHUTDOWN"
-    HEARTBEAT = "HEARTBEAT"
-    ACK = "ACK"
+    Socket mapping:
+        +0 : Control / lifecycle (long-lived per worker)
+        +1 : Metrics (short-lived per send)
+        +2 : Gradients (short-lived per send)
+        +7 : Checkpoints (short-lived per send)
+    """
 
-    # --- Training data / tensors --------------------------------------------
-    BATCH_DATA = "BATCH_DATA"       # orchestrator -> worker: inputs batch
-    ACTIVATIONS = "ACTIVATIONS"     # shard -> next shard: fwd activations
-    GRADIENTS = "GRADIENTS"         # shard -> prev shard: bwd gradients
-    LABELS = "LABELS"               # orchestrator -> worker: ground-truth labels
+    # ---------------- Control & Lifecycle ----------------
+    CONTROL_START = "CONTROL_START"                     # orch -> workers (optional warmup/reset)
+    CONTROL_STOP = "CONTROL_STOP"                       # orch -> workers (graceful shutdown)
+    CONTROL_HELLO = "CONTROL_HELLO"                     # worker -> orch (register)
+    CONTROL_ACK = "CONTROL_ACK"                         # worker <-> orch (barrier / status)
+    CONTROL_HEARTBEAT = "CONTROL_HEARTBEAT"             # worker -> orch (liveness)
 
-    # --- Model state / weights ----------------------------------------------
-    MODEL_CONFIG = "MODEL_CONFIG"   # orchestrator -> worker: hyperparams / structural info
-    MODEL_WEIGHTS = "MODEL_WEIGHTS" # orchestrator <-> worker: full/broadcasted state_dict
-    MODEL_UPDATE = "MODEL_UPDATE"   # orchestrator -> worker: apply these grads / sync step
+    # ---------------- Step / Training Control ----------------
+    CONTROL_DATA_PARALLEL_STEP = "CONTROL_DATA_PARALLEL_STEP"   # orch -> workers
+    CONTROL_PIPELINE_PHASE1 = "CONTROL_PIPELINE_PHASE1"         # orch -> all workers (forward start)
+    CONTROL_PIPELINE_PHASE2 = "CONTROL_PIPELINE_PHASE2"         # orch -> last worker only (labels/loss/backward start)
+    CONTROL_PIPELINE_BACKWARD = "CONTROL_PIPELINE_BACKWARD"     # orch -> mid/earlier shard (propagate upstream grad)
 
-    # --- Metrics / telemetry -------------------------------------------------
-    LOSS = "LOSS"                   # worker -> orchestrator: scalar loss
-    METRICS = "METRICS"             # worker -> orchestrator: throughput, ppl, etc.
+    # ---------------- Activation Relay (optional future path) ----------------
+    ACTIVATION_FRAME = "ACTIVATION_FRAME"               # orch -> worker (relay activations to next stage)
 
-    # --- Pipeline phase coordination ----------------------------------------
-    PHASE1 = "PHASE1"               # "forward phase" broadcast / step barrier
-    PHASE2 = "PHASE2"               # "backward/optim phase" / label dispatch
+    # ---------------- Gradient Flow ----------------
+    BACKWARD_READY = "BACKWARD_READY"                   # worker -> orch (done backward, upstream grad ready)
 
-    # --- Error / recovery ----------------------------------------------------
-    ERROR = "ERROR"                 # worker/orchestrator -> peer: error description
-    RETRY = "RETRY"                 # orchestrator -> worker: resend request, re-run step
+    # ---------------- Metrics / Gradients / Checkpoints ----------------
+    METRICS_STEP = "METRICS_STEP"                       # worker -> orch (+1 socket)
+    GRADIENTS_UPLOAD = "GRADIENTS_UPLOAD"               # worker -> orch (+2 socket)
+    CHECKPOINT_SHARD_UPLOAD = "CHECKPOINT_SHARD_UPLOAD" # worker -> orch (+7 socket)
+
+    # ---------------- Tensor-Parallel Collectives ----------------
+    TENSOR_FORWARD_GATHER = "TENSOR_FORWARD_GATHER"     # worker <-> orch (gather partial Y along model dim)
+    TENSOR_BACKWARD_REDUCE = "TENSOR_BACKWARD_REDUCE"   # worker <-> orch (all-reduce/avg dLoss/dX)
+    TENSOR_SYNC_BARRIER = "TENSOR_SYNC_BARRIER"         # worker <-> orch (simple barrier if needed)
 
 
 @dataclass
 class Message:
     """
-    Structured message used by MessageProtocol.
+    Canonical message container.
 
-    msg_type: MessageType enum identifying the packet role.
-    payload: Any picklable data (dicts, lists, scalars, numpy arrays, state_dict chunks, etc.).
-    metadata: Small dict for routing/extra keys: {"layer_start":6,"layer_end":12,"timestamp":...}
-    step: Training step this message is about.
-    gpu_id: Which GPU index (local index on that machine) sent this, if relevant.
-    phase: "train" or "val" or "phase1"/"phase2", etc.
+    Fields:
+        msg_type: MessageType enum
+        payload:  Picklable body (dict / list / numpy array / etc.)
+        metadata: Routing/context like {"layer_start":0,"layer_end":6}
+        step:     Global training step this refers to
+        gpu_id:   Sender GPU ID (worker local index)
+        phase:    "train", "val", "phase1", etc.
+        micro_batch_idx: which micro-batch in the pipeline (for overlap)
+        num_micro_batches: total micro-batches in this step
     """
 
     msg_type: MessageType
-    payload: Any
+    payload: Any = None
     metadata: Optional[Dict] = None
     step: Optional[int] = None
     gpu_id: Optional[int] = None
     phase: Optional[str] = None
+    micro_batch_idx: Optional[int] = None
+    num_micro_batches: Optional[int] = None
 
     def to_dict(self) -> dict:
-        """Convert message into a plain dict that can be pickled or JSON'd."""
+        """
+        Make a plain dict for pickling or JSON. This is what hits the wire.
+        """
         return {
-            "msg_type": self.msg_type.value if isinstance(self.msg_type, MessageType) else self.msg_type,
+            "msg_type": (
+                self.msg_type.value
+                if isinstance(self.msg_type, MessageType)
+                else self.msg_type
+            ),
             "payload": self.payload,
             "metadata": self.metadata,
             "step": self.step,
             "gpu_id": self.gpu_id,
             "phase": self.phase,
+            "micro_batch_idx": self.micro_batch_idx,
+            "num_micro_batches": self.num_micro_batches,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Message":
-        """Inverse of to_dict()."""
+        """
+        Rebuild a Message from a dict we unpickled.
+        """
         msg_type = data["msg_type"]
         if isinstance(msg_type, str):
             msg_type = MessageType(msg_type)
@@ -100,55 +128,48 @@ class Message:
             step=data.get("step"),
             gpu_id=data.get("gpu_id"),
             phase=data.get("phase"),
+            micro_batch_idx=data.get("micro_batch_idx"),
+            num_micro_batches=data.get("num_micro_batches"),
         )
 
 
 class MessageProtocol:
     """
-    Length-prefixed, zlib-compressed, pickle-based messaging layer.
+    Length-prefixed, optional-zlib, pickle-based framing.
 
-    Wire format for each frame:
-        [4 bytes: big-endian uint32 payload_len]
-        [payload_len bytes: pickled (and optionally compressed) dict]
-
-    NOTE:
-    - We always pickle a dict (Message.to_dict()).
-    - We never pickle raw torch.Tensors directly on the main channel unless wrapped.
+    Wire frame:
+        [4 bytes big-endian uint32: body_len]
+        [body_len bytes: (maybe-compressed) pickle(Message.to_dict())]
     """
 
-    # ---------------------------
+    # ------------------------------------------------------------------
     # Core (de)serialization
-    # ---------------------------
-
+    # ------------------------------------------------------------------
     @staticmethod
     def serialize(message: Message, compress: bool = True) -> bytes:
         """
-        Turn a Message into bytes (optionally compressed).
+        Message -> bytes
         """
         raw = pickle.dumps(message.to_dict(), protocol=pickle.HIGHEST_PROTOCOL)
-        if compress:
-            raw = zlib.compress(raw, level=6)
-        return raw
+        return zlib.compress(raw, level=6) if compress else raw
 
     @staticmethod
     def deserialize(data: bytes, decompress: bool = True) -> Message:
         """
-        Bytes -> Message.
+        bytes -> Message
         """
         if decompress:
             data = zlib.decompress(data)
         msg_dict = pickle.loads(data)
         return Message.from_dict(msg_dict)
 
-    # ---------------------------
-    # Socket send/recv helpers
-    # ---------------------------
-
+    # ------------------------------------------------------------------
+    # Socket helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def pack_for_send(message: Message, compress: bool = True) -> bytes:
         """
-        Convenience helper: return header+payload bytes in one buffer.
-        Lets callers do: sock.sendall(MessageProtocol.pack_for_send(msg)).
+        Build header+payload as one contiguous buffer for sendall().
         """
         body = MessageProtocol.serialize(message, compress=compress)
         header = struct.pack("!I", len(body))
@@ -157,181 +178,98 @@ class MessageProtocol:
     @staticmethod
     def send_message(sock: socket.socket, message: Message, compress: bool = True) -> None:
         """
-        High-level safe send. Uses sendall() twice (header then body).
-        If you need a single sendall(), use pack_for_send().
+        Safe 2-part send: header then payload.
         """
-        try:
-            body = MessageProtocol.serialize(message, compress=compress)
-            header = struct.pack("!I", len(body))
-            sock.sendall(header)
-            sock.sendall(body)
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            raise ConnectionError(f"Failed to send message: {e}")
+        body = MessageProtocol.serialize(message, compress=compress)
+        header = struct.pack("!I", len(body))
+        sock.sendall(header)
+        sock.sendall(body)
 
     @staticmethod
-    def _recv_exact(sock: socket.socket, num_bytes: int) -> Optional[bytes]:
+    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
         """
-        Read exactly num_bytes from the socket, unless connection closes.
-        Returns None if EOF.
+        Read exactly n bytes or return None if peer closed.
         """
         buf = b""
-        while len(buf) < num_bytes:
-            chunk = sock.recv(num_bytes - len(buf))
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
             if not chunk:
-                return None  # peer closed
+                return None
             buf += chunk
         return buf
 
     @staticmethod
     def receive_message(
         sock: socket.socket,
+        *,
         decompress: bool = True,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        max_len_bytes: int = 100 * 1024 * 1024,  # 100 MB sanity cap
     ) -> Optional[Message]:
         """
-        Blocking receive of a single Message frame.
-
-        timeout:
-            None  -> blocking
-            float -> set a temporary socket timeout in seconds
+        Blocking receive of a single framed Message.
 
         Returns:
-            Message or None if peer closed cleanly.
-
+            Message, or None if the peer closed cleanly.
         Raises:
-            TimeoutError if we hit timeout
-            ConnectionError for socket breakage
-            ValueError if payload length is insane
+            TimeoutError, ConnectionError, ValueError
         """
         prev_timeout = sock.gettimeout()
         try:
-            # apply temporary timeout policy
             sock.settimeout(timeout if timeout is not None else None)
 
-            # read header
             header = MessageProtocol._recv_exact(sock, 4)
             if header is None:
-                return None  # remote closed
+                return None
             (length,) = struct.unpack("!I", header)
 
-            # sanity limit
-            if length > 100 * 1024 * 1024:  # 100 MB safety cap
+            if length > max_len_bytes:
                 raise ValueError(f"Message too large: {length} bytes")
 
-            # read payload
             body = MessageProtocol._recv_exact(sock, length)
             if body is None:
-                return None  # remote closed mid-frame
+                return None
 
-            # decode
-            msg = MessageProtocol.deserialize(body, decompress=decompress)
-            return msg
+            return MessageProtocol.deserialize(body, decompress=decompress)
 
         except socket.timeout as e:
             raise TimeoutError(f"Receive timeout: {e}")
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            raise ConnectionError(f"Failed to receive message: {e}")
+            raise ConnectionError(f"Socket receive failed: {e}")
         finally:
-            # restore original timeout
             sock.settimeout(prev_timeout)
 
-    # ---------------------------
-    # Tensor helpers
-    # ---------------------------
-
+    # ------------------------------------------------------------------
+    # Tensor helpers (activations, gradients, etc.) — optional path
+    # ------------------------------------------------------------------
     @staticmethod
-    def send_tensor(
-        sock: socket.socket,
-        tensor,
-        metadata: Optional[Dict] = None,
+    def wrap_tensor_payload(
+        tensor: torch.Tensor,
         *,
-        msg_type: MessageType = MessageType.ACTIVATIONS,
-        step: Optional[int] = None,
-        gpu_id: Optional[int] = None,
-        phase: Optional[str] = None,
-        compress: bool = False,
-    ) -> None:
+        include_grad: bool = False,
+    ) -> Dict[str, Any]:
         """
-        Send a torch.Tensor over the wire by wrapping it in a Message.
-
-        We:
-        - move tensor to CPU
-        - convert to numpy
-        - include shape, dtype, device, requires_grad, etc.
-        - attach optional routing info (step, gpu_id, phase)
-
-        NOTE: msg_type defaults to ACTIVATIONS but can be GRADIENTS, LABELS, etc.
+        Turn a torch.Tensor into a picklable dict payload.
+        Used for ACTIVATION_FRAME and similar messages.
         """
-        import torch
-        import numpy as np  # noqa: F401 (pickle handles numpy arrays)
-
         cpu_t = tensor.detach().cpu()
-        tensor_np = cpu_t.numpy()
-
-        payload = {
-            "data": tensor_np,                          # numpy array (picklable)
-            "shape": tuple(cpu_t.shape),                # (B, T, C) etc.
-            "dtype": str(cpu_t.dtype),                  # 'torch.float32', etc.
-            "requires_grad": bool(tensor.requires_grad),
-            "device_str": str(tensor.device),
+        return {
+            "tensor_np": cpu_t.numpy(),          # numpy array
+            "shape": tuple(cpu_t.shape),
+            "dtype": str(cpu_t.dtype),
+            "requires_grad": bool(
+                tensor.requires_grad if include_grad else False
+            ),
         }
-
-        full_meta = dict(metadata or {})
-        if step is not None:
-            full_meta["step"] = step
-        if gpu_id is not None:
-            full_meta["gpu_id"] = gpu_id
-        if phase is not None:
-            full_meta["phase"] = phase
-
-        message = Message(
-            msg_type=msg_type,
-            payload=payload,
-            metadata=full_meta if full_meta else None,
-            step=step,
-            gpu_id=gpu_id,
-            phase=phase,
-        )
-
-        MessageProtocol.send_message(sock, message, compress=compress)
 
     @staticmethod
-    def receive_tensor(
-        sock: socket.socket,
+    def unwrap_tensor_payload(
+        payload: Dict[str, Any],
         device: str = "cpu",
-        timeout: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         """
-        Receive a Message that wraps a tensor, rebuild the torch.Tensor,
-        and move it to the requested device.
-
-        Returns:
-            (tensor, info) where:
-                tensor = reconstructed torch.Tensor on `device`
-                info   = dict with metadata/attrs like 'requires_grad', 'gpu_id', etc.
+        Rebuild a tensor from wrap_tensor_payload() dict.
+        Returned tensor is placed on `device`.
         """
-        import torch
-
-        msg = MessageProtocol.receive_message(sock, timeout=timeout)
-        if msg is None:
-            return None, None
-
-        payload = msg.payload
-        tensor_np = payload["data"]  # numpy array that we pickled
-        t = torch.from_numpy(tensor_np).to(device)
-
-        # we don't reapply requires_grad here automatically.
-        # upstream code can call t.requires_grad_(True) if it needs to backprop.
-        info = {
-            "shape": payload.get("shape"),
-            "dtype": payload.get("dtype"),
-            "requires_grad": payload.get("requires_grad", False),
-            "device_str": payload.get("device_str"),
-            "metadata": msg.metadata,
-            "step": msg.step,
-            "gpu_id": msg.gpu_id,
-            "phase": msg.phase,
-            "msg_type": msg.msg_type,
-        }
-
-        return t, info
+        t = torch.from_numpy(payload["tensor_np"]).to(device)
+        return t
