@@ -342,13 +342,13 @@ effective_batch_size = config.batch_size * config.micro_batches
 
 ## 🐛 Troubleshooting
 
-> ⚠️ **Note on Error**
-> 
-> 🟨 Honestly, GPU error codes can get a little funky in my opinion.  
-> In your development, consider that a lot of the time during training (and sometimes inference),  
-> a simple restart is all that’s needed and you’ll progress until the next error.  
-> Obscure computational or memory errors lurk — you don’t always need to hunt them down  
-> until you absolutely have to.
+<h3 style="color:#ffcc00;">⚠️ Note on Error</h3>
+<p><b>Honestly, GPU error codes can get a little funky in my opinion.</b></p>
+<p>In your development, consider that a lot of the time during training (and sometimes inference),  
+a simple restart is all that’s needed and you’ll progress until the next error.<br>
+Obscure computational or memory errors lurk — you don’t always need to hunt them down  
+until you absolutely have to.</p>
+
 
 
 ### Connection Issues
