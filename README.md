@@ -342,7 +342,7 @@ python -m distrib_train_net.workers.network_worker \
 ### 2. Network Optimization
 
 - Use high-bandwidth interconnect (InfiniBand, 10GbE+)
-- Place orchestrator on fastest node
+- Place orchestrator on fastest node or Run remotely within network
 - Minimize cross-datacenter training
 - Use compression for slow networks
 
