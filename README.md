@@ -341,15 +341,15 @@ effective_batch_size = config.batch_size * config.micro_batches
 ---
 
 ## 🐛 Troubleshooting
-<p align="left">
-  <img src="https://svg-badge.vercel.app/api?text=⚠️%20Note%20on%20Error&color=yellow" />
-</p>
 
+>  **A Devs Note on Errors**
+> 
 > Honestly, GPU error codes can get a little funky in my opinion.  
 > In your development, consider that a lot of the time during training (and sometimes inference),  
 > a simple restart is all that’s needed and you’ll progress until the next error.  
 > Obscure computational or memory errors lurk — you don’t always need to hunt them down  
 > until you absolutely have to.
+
 
 
 
