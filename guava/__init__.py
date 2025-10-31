@@ -30,7 +30,7 @@ Example Usage:
     ```
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 from .config import DistributedConfig, ParallelismStrategy
 from .orchestrator import Orchestrator
