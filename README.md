@@ -511,7 +511,7 @@ By default we request:
 But you can push it higher on Windows/Linux.
 
 Cranking buffers:
-- 32MB, 64MB, even 128MB **per socket** can work on Windows/Linux for a *small number* of long-lived sockets.  
+- 32MB, 64MB, even 128MB **per socket** can work on Windows/Linux for a *fair number* of long-lived sockets.  
   That’s literally our pattern: a handful of fat pipes between `orchestrator <-> worker` for control, gradients, checkpoints. It’s not crazy.
 
 Why you *might* want giant buffers:
