@@ -137,18 +137,6 @@ python -c "import torch; print('cuda_available=', torch.cuda.is_available()); pr
 If `cuda_available=True` and `gpu_count>0`, that machine is ready to act as a GPU worker.
 If it's `False`, you can still run the orchestrator there (CPU-only is fine).
 
-⚠ Python support  
-PyTorch does *not* publish wheels for every Python version the second it drops.  
-If you're on something extremely new (like Python 3.14) and wheels aren't available yet, install a supported Python (for example 3.10–3.12) in a fresh venv.
-
-Quick venv (Windows PowerShell example):
-
-```powershell
-py -3.12 -m venv venv
-.env\Scriptsctivate
-python -m pip install --upgrade pip
-```
-
 ### Step 2. Install Guava
 Once PyTorch is working in that venv:
 
