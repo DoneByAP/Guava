@@ -508,25 +508,72 @@ print(cfg.layers_per_gpu)  # auto-filled mapping per GPU
 ## 🌐 Networking / Sockets
 
 All communication is plain TCP. We tune sockets with `socket_utils.optimize_socket_for_network()`:
-- `TCP_NODELAY` → low latency
-- `SO_KEEPALIVE` → detect dead peers
-- Big send/recv buffers (up to ~16MB on Linux/Windows, ~8MB on macOS)
-- Blocking reads with `[4-byte length][payload]` framing
-- Payload is zlib-compressed pickle
+- `TCP_NODELAY` → low latency for control / ACK messages.
+- `SO_KEEPALIVE` → eventually detect dead peers.
+- Large `SO_SNDBUF` / `SO_RCVBUF` → let us push fat tensors without stalling.
+- Blocking reads with `[4-byte length][payload]` framing.
+- Payload is zlib-compressed pickle.
+
+### Buffer sizing
+
+By default we request:
+- ~16MB send/recv buffers on Windows and Linux
+- ~8MB on macOS (macOS tends to clamp aggressively)
+
+But you can push it higher on Windows/Linux.
+
+Cranking buffers:
+- 32MB, 64MB, even 128MB **per socket** can work on Windows/Linux for a *small number* of long-lived sockets.  
+  That’s literally our pattern: a handful of fat pipes between `orchestrator <-> worker` for control, gradients, checkpoints. It’s not crazy.
+
+Why you *might* want giant buffers:
+- You're shipping big activation tensors / gradient blobs
+- You’ve got high-bandwidth links (10GbE, 25GbE, InfiniBand, etc.)
+- The RTT between orchestrator and worker is not trivial (not on the same PCIe switch / same host loopback).  
+  Example: different physical machines across the rack on 25GbE.
+
+In that situation, large socket buffers let the sender stay ahead and keep the pipe full without constantly stalling on `send()` waits.
+
+Where huge buffers can bite you:
+1. **Many workers per box**  
+   If you spin up hundreds or thousands of workers all pointing at one orchestrator, those 64MB+ buffers multiply and can starve kernel memory.
+2. **Local security inspection / firewall hooks**  
+   On Windows, Defender / firewall inspection sometimes copies payloads before release. Giant buffers can actually introduce jitter and weird latency spikes under heavy load.
+
+Rule of thumb:
+- Single orchestrator ⇄ a few powerful GPU workers over real network fabric (10GbE+): go ahead and use 32MB–64MB+ buffers.
+- One machine, localhost / loopback / same motherboard: bigger than ~16MB usually doesn’t help because latency is already microseconds.
+
+Guava exposes this through `DistributedConfig.socket_buffer_mb`. That value (in MB) is converted to bytes and passed down to `optimize_socket_for_network()`, which requests that buffer size on every training socket. The OS may clamp it lower, and that’s fine.
 
 ### Port Layout (relative to `master_port`)
-- `+0` Control plane  
-  Registration (`CONTROL_HELLO`), ACK barriers, `BACKWARD_READY`.
-- `+1` Metrics upload  
-  Short-lived connection per report.
-- `+2` Gradient upload  
-  Short-lived connection per step.
-- `+7` Checkpoint upload  
-  Short-lived connection on shutdown or save.
-- `+3,+4,+5,+6` Reserved  
-  (activation relay, heartbeat, tensor-parallel collectives, etc.)
 
-Workers keep a long-lived control socket on `+0`. Metrics/gradients/checkpoints go over fresh short-lived sockets.
+Guava reserves a small "port block" starting at `master_port`:
+
+- `+0` Control plane  
+  Long-lived connection. Handles:
+  - worker registration (`CONTROL_HELLO`)
+  - training step commands (`CONTROL_DATA_PARALLEL_STEP`, `CONTROL_PIPELINE_PHASE1`, etc.)
+  - per-step ACK barriers (`CONTROL_ACK`)
+  - backward coordination (`BACKWARD_READY`)
+  - tensor-parallel collectives
+
+- `+1` Metrics upload  
+  Short-lived connection. Worker connects, sends `METRICS_STEP`, disconnects.
+
+- `+2` Gradient upload  
+  Short-lived connection. Worker connects, sends `GRADIENTS_UPLOAD` for that step, disconnects.
+
+- `+7` Checkpoint upload  
+  Short-lived connection. Worker uploads `CHECKPOINT_SHARD_UPLOAD` on shutdown or save.
+
+- `+3,+4,+5,+6` Reserved  
+  Activation relay, heartbeat, possible future explicit tensor-parallel rendezvous channels.
+
+**Pattern:**
+- Each worker holds exactly one long-lived control socket to `master_port + 0`.  
+- Everything heavy (gradients, checkpoints) uses dedicated short-lived sockets on `+1`, `+2`, `+7`.  
+  This lets us crank per-socket buffer sizes for those fat transfers without stalling the control channel.
 
 ---
 
