@@ -11,7 +11,7 @@ long_description = (
 
 setup(
     name="guava",
-    version="0.1.0",
+    version="0.1.2",
     author="Azani",
     description="Distributed neural network training across multiple GPUs and machines (data parallel, model parallel, pipeline parallel, tensor parallel).",
     long_description=long_description,
