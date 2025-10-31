@@ -6,7 +6,7 @@ readme_path = Path(__file__).parent / "README.md"
 long_description = (
     readme_path.read_text(encoding="utf-8")
     if readme_path.exists()
-    else "Guava: distributed neural network training across multiple GPUs / machines."
+    else "Guava: Distributed neural network training across multiple GPUs / machines."
 )
 
 setup(
@@ -24,7 +24,7 @@ setup(
         "numpy",
         "tqdm",
         "psutil",
-        # torch purposely not included — users install correct CUDA wheel from PyTorch site
+        # torch purposely not included — users install correct CUDA wheel manually
     ],
 
     extras_require={
@@ -33,6 +33,12 @@ setup(
             "black",
             "flake8",
             "mypy",
+        ],
+    },
+
+    entry_points={
+        "console_scripts": [
+            "guava-version=guava.cli:main",
         ],
     },
 
