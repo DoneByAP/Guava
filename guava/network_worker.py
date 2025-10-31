@@ -20,6 +20,11 @@ We support:
 - data_parallel (every GPU full model)
 - model_parallel / pipeline_parallel (layers sharded across GPUs)
 - tensor_parallel (true intra-layer splitting with gather/reduce per layer)
+
+NEW:
+- Socket buffers are now configurable via cfg.socket_buffer_mb.
+  We pass that to optimize_socket_for_network(...) so Windows/Linux
+  can go 32MB, 64MB+, etc. (macOS will clamp lower, that's fine).
 """
 
 import os
@@ -43,7 +48,7 @@ class NetworkWorker:
     """
     Runtime wrapper for ONE GPU.
 
-    Usage (example launcher on the worker box):
+    Typical usage on a worker box:
 
         cfg = DistributedConfig.from_env()
         nw = NetworkWorker(
@@ -56,7 +61,8 @@ class NetworkWorker:
         nw.connect_and_train()
 
     model_ctor:
-        must return the FULL model (so we can slice it if needed).
+        a 0-arg callable that returns the FULL model. We will slice
+        it if we're doing model/pipeline parallel instead of pure data parallel.
     """
 
     def __init__(
@@ -73,6 +79,11 @@ class NetworkWorker:
         self.master_port = master_port
         self.model_ctor = model_ctor  # callable -> nn.Module
 
+        # choose socket buffer size in bytes (e.g. 64MB on Windows if you want)
+        self._sock_buf_bytes = int(
+            getattr(self.cfg, "socket_buffer_mb", 16)  # default 16MB
+        ) * 1024 * 1024
+
         # long-lived control socket to orchestrator (+0)
         self.ctrl_sock: Optional[socket.socket] = None
 
@@ -80,8 +91,8 @@ class NetworkWorker:
         self.metric_sock_addr: Tuple[str, int] = (master_ip, master_port + 1)
         self.grad_sock_addr: Tuple[str, int] = (master_ip, master_port + 2)
         self.chkpt_sock_addr: Tuple[str, int] = (master_ip, master_port + 7)
-        # +3,+4,+5,+6 are reserved (activation relay / heartbeats),
-        # we piggyback ACKs/controls on ctrl_sock.
+        # +3,+4,+5,+6 are reserved (activation relay / heartbeats / TP collectives).
+        # ACKs/flow control stay on ctrl_sock.
 
         # figure out which slice of layers we own
         start_layer, end_layer = self._layer_assignment()
@@ -113,7 +124,7 @@ class NetworkWorker:
 
         self.worker.set_training_mode(True)
 
-        # for pipeline last-stage use: cache logits from PHASE1 for PHASE2 usage
+        # cache logits from PHASE1 for PHASE2 (pipeline last stage)
         self._last_logits: Optional[torch.Tensor] = None
 
     # -------------------------------------------------------------------------
@@ -123,10 +134,10 @@ class NetworkWorker:
         """
         Return [start_layer, end_layer) for this GPU.
 
-        data-parallel:
+        Pure data-parallel:
             we "own" the full stack.
-        pipeline/model/tensor-parallel:
-            cfg.layers_per_gpu[gpu_id] defines how many layers this GPU is responsible for.
+        Pipeline/model/tensor-parallel:
+            cfg.layers_per_gpu[gpu_id] is how many layers we own.
         """
         pure_dp = (
             self.cfg.data_parallel
@@ -150,17 +161,17 @@ class NetworkWorker:
         """
         Slice the transformer into [start:end] blocks for this GPU.
 
-        Assumptions on full_model:
-        - full_model.embedding
-        - full_model.pos_embedding (optional)
-        - full_model.transformer_blocks  (nn.ModuleList of blocks)
-        - full_model.ln_f
-        - full_model.lm_head
+        Assumptions about full_model:
+          full_model.embedding
+          full_model.pos_embedding (optional)
+          full_model.transformer_blocks  (nn.ModuleList)
+          full_model.ln_f
+          full_model.lm_head
 
         Rules:
-        - First shard keeps embeddings (and pos_embedding if present).
-        - Middle shards hold only their block subset.
-        - Last shard holds ln_f + lm_head.
+        - First shard keeps embeddings (+ pos_embedding if present).
+        - Middle shards keep just their transformer blocks.
+        - Last shard keeps ln_f + lm_head.
         """
 
         class ShardModule(nn.Module):
@@ -169,7 +180,7 @@ class NetworkWorker:
                 self.is_first = is_first
                 self.is_last = is_last
 
-                # first shard: embeddings
+                # first shard: embeddings / positional embeddings
                 if is_first:
                     self.embedding = parent.embedding
                     self.pos_embedding = getattr(parent, "pos_embedding", None)
@@ -177,7 +188,7 @@ class NetworkWorker:
                     self.embedding = None
                     self.pos_embedding = None
 
-                # slice transformer layers
+                # subset of transformer blocks
                 self.transformer_blocks = nn.ModuleList(
                     parent.transformer_blocks[start_idx:end_idx]
                 )
@@ -195,7 +206,7 @@ class NetworkWorker:
                 If first shard:
                     hidden_ids are token IDs [B,T] -> run embedding.
                 Else:
-                    hidden_ids are already activations from prev shard.
+                    hidden_ids are already activations.
                 """
                 x = hidden_ids
                 if self.is_first:
@@ -209,7 +220,7 @@ class NetworkWorker:
                         tok = tok + self.pos_embedding(pos_idx)
                     x = tok
 
-                # run our sub-blocks
+                # run sub-blocks
                 for block in self.transformer_blocks:
                     x = block(x)
 
@@ -235,18 +246,18 @@ class NetworkWorker:
     # Tensor Parallel helpers (Megatron-LM style via orchestrator)
     # -------------------------------------------------------------------------
     def _serialize_tensor(self, tensor: torch.Tensor) -> bytes:
-        # CPU-serialize + compress
+        """Move tensor to CPU, pickle, then zlib-compress for socket send."""
         return zlib.compress(pickle.dumps(tensor.detach().cpu(), protocol=4))
 
     def _deserialize_tensor(self, data: bytes) -> torch.Tensor:
-        # Decompress + load, move to this GPU if available
+        """Inverse of _serialize_tensor; bring to this GPU if available."""
         t = pickle.loads(zlib.decompress(data))
         return t.cuda(self.gpu_id) if torch.cuda.is_available() else t
 
     def _tp_peers(self) -> List[int]:
         """
-        Return all GPUs that co-own the same tensor-parallel group.
-        Example: tp_size=2 → groups [0,1],[2,3],...
+        Return all GPUs in our tensor-parallel group.
+        Example tp_size=2 → groups [0,1],[2,3],...
         """
         tp = int(getattr(self.cfg, "tensor_parallel_size", 1) or 1)
         if tp <= 1:
@@ -256,8 +267,8 @@ class NetworkWorker:
 
     def tensor_split(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """
-        Local shard of a full tensor along dim.
-        Typically used to split weights or activations per layer.
+        Return JUST THIS GPU's shard of a full tensor along dim.
+        Used to slice weights/activations for tensor parallel.
         """
         tp = int(getattr(self.cfg, "tensor_parallel_size", 1) or 1)
         if tp <= 1:
@@ -268,32 +279,24 @@ class NetworkWorker:
 
     def _tp_send_recv(self, msg_type: MessageType, step: int, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Send a TENSOR_* request with a tensor payload on the existing control socket,
-        then block for a single tensor response from the orchestrator.
+        Send a TENSOR_* message with a tensor payload on the control socket,
+        block for the orchestrator's collective result.
 
-        Contract with orchestrator:
-          - Worker sends Message(msg_type=TENSOR_* , step=step), then a sized payload.
-          - Orchestrator waits for all peers in the group for this step,
-            performs the collective, and replies to each with the result tensor.
+        Protocol:
+        - send header Message(msg_type=TENSOR_*, step=step)
+        - send tensor bytes
+        - orchestrator waits for all peers in tp group, does gather/reduce
+        - orchestrator replies with the final tensor for THIS worker
         """
         assert self.ctrl_sock is not None, "control socket not connected"
-        # 1) header
-        hdr = Message(
-            msg_type=msg_type,
-            step=step,
-            gpu_id=self.gpu_id,
-        )
+        hdr = Message(msg_type=msg_type, step=step, gpu_id=self.gpu_id)
         MessageProtocol.send_message(self.ctrl_sock, hdr)
-        # 2) payload
         send_with_size(self.ctrl_sock, self._serialize_tensor(tensor))
-        # 3) response tensor
         data = recv_with_size(self.ctrl_sock)
         return self._deserialize_tensor(data)
 
     def tensor_gather(self, local: torch.Tensor, step: int) -> torch.Tensor:
-        """
-        All-gather partial outputs across tensor peers to build the full activation.
-        """
+        """All-gather partial outputs across TP peers -> full activation on each peer."""
         tp_enabled = bool(getattr(self.cfg, "enable_tensor_parallel", False))
         tp_size = int(getattr(self.cfg, "tensor_parallel_size", 1) or 1)
         if not tp_enabled or tp_size <= 1:
@@ -301,9 +304,7 @@ class NetworkWorker:
         return self._tp_send_recv(MessageType.TENSOR_FORWARD_GATHER, step, local)
 
     def tensor_reduce_grad(self, local_grad: torch.Tensor, step: int) -> torch.Tensor:
-        """
-        All-reduce (average) gradients across tensor peers.
-        """
+        """All-reduce/avg gradients across TP peers."""
         tp_enabled = bool(getattr(self.cfg, "enable_tensor_parallel", False))
         tp_size = int(getattr(self.cfg, "tensor_parallel_size", 1) or 1)
         if not tp_enabled or tp_size <= 1 or local_grad is None:
@@ -315,16 +316,15 @@ class NetworkWorker:
     # -------------------------------------------------------------------------
     def _connect_ctrl(self) -> None:
         """
-        Connect long-lived control socket (master_port+0),
-        send CONTROL_HELLO registration, receive CONTROL_ACK.
+        Create long-lived control socket (master_port+0),
+        register via CONTROL_HELLO, wait for CONTROL_ACK.
         """
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        optimize_socket_for_network(s)
+        optimize_socket_for_network(s, buf_bytes=self._sock_buf_bytes)
         s.connect((self.master_ip, self.master_port + 0))
         self.ctrl_sock = s
 
         start_layer, end_layer = self._layer_assignment()
-
         hello = Message(
             msg_type=MessageType.CONTROL_HELLO,
             payload={
@@ -349,9 +349,7 @@ class NetworkWorker:
             raise RuntimeError("registration refused by orchestrator")
 
     def _send_command_ack(self, cmd_type: str, step: int) -> None:
-        """
-        Send CONTROL_ACK barrier (no new port, we reuse ctrl_sock).
-        """
+        """Barrier ACK back to orchestrator over ctrl_sock."""
         if self.ctrl_sock is None:
             return
         ack = Message(
@@ -367,12 +365,12 @@ class NetworkWorker:
 
     def _send_metrics(self, metrics: Dict[str, Any]) -> None:
         """
-        Upload METRICS_STEP once to master_port+1.
-        Non-fatal if it fails.
+        Upload METRICS_STEP once to master_port+1 (short-lived socket).
+        Non-fatal on failure.
         """
         try:
             ms = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            optimize_socket_for_network(ms)
+            optimize_socket_for_network(ms, buf_bytes=self._sock_buf_bytes)
             ms.connect(self.metric_sock_addr)
 
             msg = Message(
@@ -389,12 +387,12 @@ class NetworkWorker:
 
     def _send_gradients(self, grads: Dict[str, torch.Tensor], step: int) -> None:
         """
-        Upload GRADIENTS_UPLOAD once to master_port+2.
+        Upload GRADIENTS_UPLOAD once to master_port+2 (short-lived socket).
         If pipeline/model-parallel: ONLY final stage calls this.
         """
         try:
             gs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            optimize_socket_for_network(gs)
+            optimize_socket_for_network(gs, buf_bytes=self._sock_buf_bytes)
             gs.connect(self.grad_sock_addr)
 
             msg = Message(
@@ -422,7 +420,7 @@ class NetworkWorker:
             }
 
             cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            optimize_socket_for_network(cs)
+            optimize_socket_for_network(cs, buf_bytes=self._sock_buf_bytes)
             cs.connect(self.chkpt_sock_addr)
 
             msg = Message(
@@ -450,9 +448,10 @@ class NetworkWorker:
     # -------------------------------------------------------------------------
     def connect_and_train(self) -> None:
         """
-        1. Connect / register.
-        2. Loop: receive control Messages on ctrl_sock and handle them.
-        3. On CONTROL_STOP, upload checkpoint + exit.
+        1. Connect/register with orchestrator.
+        2. Loop forever on ctrl_sock, receiving Message objects.
+        3. Handle training / pipeline phases / activations.
+        4. On CONTROL_STOP: upload checkpoint and exit.
         """
         self._connect_ctrl()
 
@@ -461,11 +460,10 @@ class NetworkWorker:
             try:
                 msg = MessageProtocol.receive_message(self.ctrl_sock, timeout=None)
             except (ConnectionResetError, ConnectionAbortedError, OSError):
-                break  # orchestrator went away
+                break  # orchestrator disappeared
             if msg is None:
-                break  # closed
+                break
 
-            # dispatch by msg_type
             mtype = msg.msg_type
 
             if mtype == MessageType.CONTROL_START:
@@ -473,7 +471,6 @@ class NetworkWorker:
                 continue
 
             if mtype == MessageType.CONTROL_STOP:
-                # graceful shutdown
                 self._send_checkpoint()
                 running = False
                 continue
@@ -494,15 +491,14 @@ class NetworkWorker:
                 self._handle_activation_frame(msg)
                 continue
 
-            # ignore unknown / unimplemented types for now
+            # else: ignore unknown for now
 
-        # cleanup
+        # cleanup after loop
         try:
             if self.ctrl_sock:
                 self.ctrl_sock.close()
         except Exception:
             pass
-
         self.worker.cleanup()
 
     # -------------------------------------------------------------------------
@@ -511,21 +507,19 @@ class NetworkWorker:
     def _handle_train_data_parallel(self, msg: Message) -> None:
         """
         Data-parallel step:
-          - Convert lists to tensors on this GPU.
-          - Forward full model (or shard if using tensor_parallel to split weights locally).
-          - If tensor_parallel enabled, gather logits across peers.
-          - Compute CE, backward, clip.
-          - If tensor_parallel enabled, all-reduce grads across peers.
-          - Build grads dict {param_name: grad_cpu_tensor}, send to orchestrator.
-          - Optimizer step locally.
-          - Send metrics and CONTROL_ACK.
+        1. Build tensors on this GPU.
+        2. Forward -> logits (gather via tensor-parallel if enabled).
+        3. Compute CE loss, backward, grad clip.
+        4. tensor-parallel grad all-reduce if needed.
+        5. Send grads to orchestrator, optimizer.step() locally.
+        6. Send metrics + CONTROL_ACK.
         """
         step = int(msg.step if msg.step is not None else -1)
         phase = msg.phase or "train"
         batch = msg.payload or {}
         ack_required = bool((msg.metadata or {}).get("ack_required", False))
 
-        # to tensors
+        # tensors
         input_ids = torch.tensor(
             batch["input_ids"],
             dtype=torch.long,
@@ -540,14 +534,14 @@ class NetworkWorker:
 
         self.worker.set_training_mode(phase == "train")
 
-        # forward -> local logits
+        # forward
         logits = self.worker.forward(input_ids)
 
-        # --- Tensor Parallel Gather (if enabled) ---
+        # tensor-parallel gather (reconstruct full logits if split)
         if getattr(self.cfg, "enable_tensor_parallel", False):
             logits = self.tensor_gather(logits, step)
 
-        # CE loss + backward
+        # loss/backward
         loss_val = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -566,26 +560,28 @@ class NetworkWorker:
                         self.cfg.max_grad_norm,
                     )
 
-                # --- Tensor Parallel Gradient Reduce ---
+                # tensor-parallel grad reduce
                 if getattr(self.cfg, "enable_tensor_parallel", False):
                     for _, param in self.worker.model.named_parameters():
                         if param.grad is not None:
                             param.grad = self.tensor_reduce_grad(param.grad, step)
 
-        # gather grads
+        # collect grads for orchestrator
         grads_list = self.worker.get_gradients()
         grad_dict: Dict[str, torch.Tensor] = {}
         for (pname, param), g in zip(self.worker.model.named_parameters(), grads_list):
-            grad_dict[pname] = (g.detach().cpu() if g is not None
-                                else torch.zeros_like(param).cpu())
+            grad_dict[pname] = (
+                g.detach().cpu() if g is not None
+                else torch.zeros_like(param).cpu()
+            )
 
-        # upload grads to orchestrator (+2)
+        # upload grads (+2)
         self._send_gradients(grad_dict, step)
 
         # local optimizer step
         self.worker.update_weights()
 
-        # send metrics
+        # metrics
         metrics = {
             "gpu_id": self.gpu_id,
             "step": step,
@@ -595,7 +591,7 @@ class NetworkWorker:
         }
         self._send_metrics(metrics)
 
-        # CONTROL_ACK barrier
+        # ACK barrier
         if ack_required:
             self._send_command_ack("CONTROL_DATA_PARALLEL_STEP", step)
 
@@ -605,12 +601,9 @@ class NetworkWorker:
     def _handle_pipeline_phase1(self, msg: Message) -> None:
         """
         Phase1 (forward kickoff):
-          - Stage0: receives input_ids, does forward(), produces activations.
-          - Intermediate stages: may just ACK now and then wait for ACTIVATION_FRAME.
-          - Any stage that *does* run forward and is NOT final shard
-            should forward activations to next stage. (Future: via orchestrator
-            ACTIVATION_FRAME relay; currently not fully implemented.)
-          - Final shard can cache logits for CE in phase2.
+        - Stage0: receives input_ids, does forward(), produces activations.
+        - Other stages: may just ACK now and then later get ACTIVATION_FRAME.
+        - Final shard caches logits for Phase2.
         """
         step = int(msg.step if msg.step is not None else -1)
         phase = msg.phase or "train"
@@ -631,20 +624,19 @@ class NetworkWorker:
             )
             activations = self.worker.forward(input_ids)
 
-            # If tensor-parallel & we are the last shard (produces logits), gather to full logits
+            # If we're last shard and tensor-parallel is on, gather to full logits
             start_layer, end_layer = self._layer_assignment()
             last_end = self.cfg.n_layers
             if end_layer == last_end and getattr(self.cfg, "enable_tensor_parallel", False):
                 activations = self.tensor_gather(activations, step)
 
-        # cache logits if we're last shard
+        # cache logits if we're final shard
         start_layer, end_layer = self._layer_assignment()
         last_end = self.cfg.n_layers
         if activations is not None and end_layer == last_end:
-            # final shard -> activations are final logits
             self._last_logits = activations
 
-        # (Future) activation relay to next shard via ACTIVATION_FRAME.
+        # (future): forward activations to next shard via ACTIVATION_FRAME relay
 
         if ack_required:
             self._send_command_ack("CONTROL_PIPELINE_PHASE1", step)
@@ -655,13 +647,11 @@ class NetworkWorker:
     def _handle_pipeline_phase2(self, msg: Message) -> None:
         """
         Phase2:
-          - ONLY final shard cares about labels.
-          - Use cached self._last_logits from phase1 or ACTIVATION_FRAME.
-          - If tensor-parallel, ensure cached logits are gathered.
-          - Compute CE, backward(), clip, TP-grad-reduce, prepare grad_dict.
-          - Upload grads (GRADIENTS_UPLOAD) to orchestrator.
-          - Optimizer step.
-          - Metrics + CONTROL_ACK.
+        - ONLY final shard cares about labels.
+        - Use cached self._last_logits from phase1 / ACTIVATION_FRAME.
+        - Compute CE, backward, clip, tensor-parallel grad reduce.
+        - Upload grads to orchestrator, optimizer.step().
+        - Metrics + CONTROL_ACK.
         """
         step = int(msg.step if msg.step is not None else -1)
         phase = msg.phase or "train"
@@ -690,9 +680,8 @@ class NetworkWorker:
                 self._send_command_ack("CONTROL_PIPELINE_PHASE2", step)
             return
 
-        # If tensor-parallel was used, ensure logits are full-gathered (already done in phase1 if last shard)
+        # ensure logits are gathered if tensor-parallel
         if getattr(self.cfg, "enable_tensor_parallel", False):
-            # No-op if already gathered; safe to call.
             self._last_logits = self.tensor_gather(self._last_logits, step)
 
         labels = torch.tensor(
@@ -717,13 +706,13 @@ class NetworkWorker:
                     self.cfg.max_grad_norm,
                 )
 
-            # Tensor-parallel grad all-reduce (per-parameter)
+            # tensor-parallel grad reduce
             if getattr(self.cfg, "enable_tensor_parallel", False):
                 for _, param in self.worker.model.named_parameters():
                     if param.grad is not None:
                         param.grad = self.tensor_reduce_grad(param.grad, step)
 
-            # build gradient dict
+            # build gradient dict to ship
             grad_dict: Dict[str, torch.Tensor] = {}
             for pname, param in self.worker.model.named_parameters():
                 grad_dict[pname] = (
@@ -756,21 +745,21 @@ class NetworkWorker:
     def _handle_activation_frame(self, msg: Message) -> None:
         """
         Placeholder for activation relay logic if orchestrator
-        ever routes ACTIVATION_FRAME messages between shards.
+        starts routing ACTIVATION_FRAME between shards.
 
         Expected msg.payload:
-            {
-              "from_gpu": int,
-              "to_gpu":   int,
-              "tensor_payload": { "tensor_np": ..., "shape": ..., "dtype": ... }
-            }
+        {
+          "from_gpu": int,
+          "to_gpu":   int,
+          "tensor_payload": { "tensor_np": ..., "shape": ..., "dtype": ... }
+        }
 
-        Steps:
-          1. Rebuild activation tensor on this GPU.
-          2. Run forward() through our shard.
-          3. If not final shard -> forward again to next GPU (future).
-          4. If final shard -> store logits in self._last_logits.
-          5. Send CONTROL_ACK to orchestrator so it knows we consumed it.
+        Flow:
+        1. Rebuild activation on this GPU.
+        2. Run forward() through our shard.
+        3. If final shard, cache logits.
+        4. (Future) forward activations to next shard.
+        5. Send CONTROL_ACK so orchestrator knows we're done.
         """
         step = int(msg.step if msg.step is not None else -1)
         payload = msg.payload or {}
@@ -794,7 +783,7 @@ class NetworkWorker:
         if end_layer == last_end:
             self._last_logits = out
 
-        # (future): forward 'out' again to downstream shard here...
+        # TODO: forward 'out' to downstream shard (future)
 
         # ACK back so orchestrator knows we consumed the frame
         self._send_command_ack("ACTIVATION_FRAME", step)
