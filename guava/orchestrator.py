@@ -6,19 +6,19 @@ Central coordinator ("master" / "brain").
 Responsibilities:
 - Listen for worker connections
 - Send commands/batches to workers (data-parallel or pipeline-parallel)
-- Receive gradients / metrics / checkpoints
+- Receive gradients / metrics / checkpoints on PERSISTENT channels
 - Run the top-level training loop
 - Coordinate full multi-stage backward across all pipeline shards
 
 Network contract (all TCP):
 - Control / registration / ACKs / BACKWARD_READY : master_port+0 (long-lived socket per worker)
 - Metrics upload:                                 master_port+1 (short-lived per send)
-- Gradients upload:                               master_port+2 (short-lived per send)
+- Gradients upload:                               master_port+2 (PERSISTENT per worker)
 - Activation uplink / relay:                      master_port+3 (reserved / future)
 - Activation ACK / heartbeat:                     master_port+4 (reserved / future)
 - Resend probe / heartbeat:                       master_port+5 (reserved / future)
 - Command ACK legacy port:                        master_port+6 (unused now; ACKs come on +0)
-- Checkpoints upload:                             master_port+7 (short-lived per send)
+- Checkpoints upload:                             master_port+7 (PERSISTENT per worker)
 
 All control messages use MessageProtocol and Message/MessageType.
 We run on CPU and act as the source of truth for weights.
@@ -37,7 +37,8 @@ import torch.nn.functional as F
 from .config import DistributedConfig
 from .socket_utils import optimize_socket_for_network
 from .protocol import MessageType, Message, MessageProtocol
-
+from .protocol import MessageType, Message, MessageProtocol, MessageCorruptedError
+from .energy_monitor import get_error_tracker, ErrorSeverity, track_errors  # ✅ ADD track_errors
 
 class Orchestrator:
     """
@@ -46,6 +47,7 @@ class Orchestrator:
     - Optimizer
     - Training scheduler for data-parallel or pipeline-parallel
     - Control sockets for each worker
+    - PERSISTENT gradient + checkpoint sockets for each worker
     - Gradient + metric buffers
     - BACKWARD_READY queues for upstream grad handoff between shards
 
@@ -59,6 +61,31 @@ class Orchestrator:
     """
 
     def __init__(self, config: DistributedConfig, mode: str = "orchestrator"):
+        # ✅ NEW: Auto-discover and allocate ports if not set
+        if not hasattr(config, 'master_port') or config.master_port is None:
+            from .autodiscovery_port_manager import AutoDiscoveryPortManager
+            
+            # Generate job name from timestamp if not provided
+            job_name = getattr(config, 'job_name', None)
+            if job_name is None:
+                import time
+                job_name = f"guava_train_{time.strftime('%Y%m%d_%H%M%S')}"
+                config.job_name = job_name
+            
+            # Auto-allocate ports
+            pm = AutoDiscoveryPortManager()
+            allocated_port = pm.allocate_port_range(job_id=job_name)
+            
+            if allocated_port is None:
+                raise RuntimeError("❌ Could not allocate ports for training!")
+            
+            config.master_port = allocated_port
+            self._port_manager = pm  # Keep reference for cleanup
+            print(f"🎯 Auto-allocated ports for job '{job_name}': {allocated_port}-{allocated_port+8}")
+        else:
+            self._port_manager = None
+            print(f"📌 Using manually specified port: {config.master_port}")
+        
         self.cfg = config
         self.mode = mode
 
@@ -82,6 +109,16 @@ class Orchestrator:
         #   gpu_id -> socket
         self.ctrl_sockets: Dict[int, socket.socket] = {}
 
+        # PERSISTENT gradient sockets (NEW):
+        #   gpu_id -> socket (stays open entire training session)
+        self.grad_sockets: Dict[int, socket.socket] = {}
+        self.grad_sockets_lock = threading.Lock()
+
+        # PERSISTENT checkpoint sockets (NEW):
+        #   gpu_id -> socket (stays open entire training session)
+        self.chkpt_sockets: Dict[int, socket.socket] = {}
+        self.chkpt_sockets_lock = threading.Lock()
+
         # Gradient buffer (grad_server fills this, training loop drains it)
         #   gpu_id -> { param_name: grad_tensor_cpu }
         self.gradients_lock = threading.Lock()
@@ -90,6 +127,7 @@ class Orchestrator:
         # Metrics buffer (metrics_server fills this, training loop drains it)
         self.metrics_lock = threading.Lock()
         self.collected_metrics: List[Dict[str, Any]] = []
+        self.worker_reconnect_count: Dict[int, int] = {}  # Track reconnection attempts
 
         # BACKWARD_READY queues:
         # Each worker sends BACKWARD_READY on its ctrl socket when it finishes backward().
@@ -100,6 +138,30 @@ class Orchestrator:
 
         # Bring up background listener servers (+0 control, +1 metrics, +2 grads, +7 checkpoints)
         self._start_listener_threads()
+
+
+    def __enter__(self):
+        """
+        Context manager entry - allows 'with Orchestrator(cfg) as orch:' syntax.
+        Returns self so you can use the orchestrator in the with block.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit - cleanup happens automatically when leaving 'with' block.
+        
+        Args:
+            exc_type: Exception type if an error occurred, None otherwise
+            exc_val: Exception value if an error occurred
+            exc_tb: Exception traceback if an error occurred
+        
+        Returns:
+            False to re-raise any exception that occurred in the with block
+        """
+        self.shutdown()
+        return False  # Don't suppress exceptions - let them propagate
+    
 
     # ---------------------------------------------------------------------
     # Public API
@@ -191,6 +253,7 @@ class Orchestrator:
 
         print("Training loop finished.")
 
+    @track_errors(severity=ErrorSeverity.WARNING, reraise=False)
     def save_checkpoint(self, path: str) -> None:
         """
         Save orchestrator's authoritative model weights to disk.
@@ -211,13 +274,7 @@ class Orchestrator:
         num_epochs: int,
         val_interval: int,
     ) -> None:
-        """
-        Classic synchronous data-parallel:
-          1. Broadcast batch to every worker via CONTROL_DATA_PARALLEL_STEP.
-          2. Each worker runs forward+loss+backward locally.
-          3. Each worker uploads grads via GRADIENTS_UPLOAD.
-          4. We average and step on the master model.
-        """
+        """Data-parallel training with worker failure detection, recovery, and resend logic."""
         for epoch in range(num_epochs):
             self.epoch_idx = epoch
             print(f"[Epoch {epoch+1}/{num_epochs}] (data-parallel)")
@@ -226,36 +283,145 @@ class Orchestrator:
                 self.global_step += 1
                 input_ids, labels = batch
 
-                # Send same batch to every worker
+                # Build step message
                 step_msg = Message(
                     msg_type=MessageType.CONTROL_DATA_PARALLEL_STEP,
                     payload={
-                        "input_ids": input_ids.tolist(),
-                        "labels": labels.tolist(),
+                        "input_ids": input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
+                        "labels": labels.tolist() if isinstance(labels, torch.Tensor) else labels,  # ← HANDLES BOTH TENSOR AND DICT
                     },
                     metadata={"ack_required": True},
                     step=self.global_step,
                     phase="train",
                 )
-                self._broadcast_ctrl(step_msg)
+                
+                # ✅ SEND WITH RESEND LOGIC (up to 3 attempts)
+                max_send_attempts = 3
+                step_success = False
+                
+                for send_attempt in range(max_send_attempts):
+                    # Check if any workers flagged corruption and need resend
+                    with self._backward_lock:
+                        resend_needed = getattr(self, '_resend_needed', set())
+                        if resend_needed:
+                            print(f"[orchestrator] 🔄 Attempt {send_attempt+1}: Resending batch to GPUs: {resend_needed}")
+                            # Clear the flag
+                            self._resend_needed = set()
+                    
+                    # ✅ BROADCAST to all workers (with retry on network errors)
+                    broadcast_success = False
+                    for broadcast_attempt in range(3):
+                        try:
+                            self._broadcast_ctrl(step_msg)
+                            broadcast_success = True
+                            break
+                        except Exception as e:
+                            print(f"[orchestrator] ⚠️ Broadcast sub-attempt {broadcast_attempt+1}/3 failed: {e}")
+                            if broadcast_attempt < 2:
+                                print(f"[orchestrator] 🔄 Retrying broadcast in 3s...")
+                                time.sleep(3)
+                            else:
+                                print(f"[orchestrator] ❌ Broadcast failed after 3 sub-attempts")
+                    
+                    if not broadcast_success:
+                        print("[orchestrator] ❌ Cannot send batch to workers")
+                        if send_attempt == max_send_attempts - 1:
+                            print("[orchestrator] ❌ All broadcast attempts exhausted, emergency checkpoint")
+                            self._emergency_checkpoint()
+                            return
+                        else:
+                            print(f"[orchestrator] 🔄 Will retry entire send (attempt {send_attempt+2}/{max_send_attempts})...")
+                            time.sleep(5)
+                            continue
 
-                # Wait for all workers to upload grads, then step
-                self._aggregate_and_step(
-                    pipeline_mode=False  # data-parallel: expect grads from all workers
-                )
+                    # ✅ WAIT FOR GRADIENTS with built-in retry logic
+                    success = self._aggregate_and_step(pipeline_mode=False)
+                    
+                    if success:
+                        # ✅ SUCCESS! Move to next batch
+                        step_success = True
+                        break
+                    
+                    # Failed - check WHY
+                    print(f"[orchestrator] ⚠️ Step failed on attempt {send_attempt+1}/{max_send_attempts}")
+                    
+                    # Check if it's due to corruption needing resend
+                    with self._backward_lock:
+                        resend_needed = getattr(self, '_resend_needed', set())
+                        if resend_needed and send_attempt < max_send_attempts - 1:
+                            print(f"[orchestrator] 🔄 Corruption detected, will resend to {resend_needed}...")
+                            time.sleep(2)
+                            continue  # Try again with resend
+                    
+                    # Not corruption - check if workers are alive
+                    if send_attempt < max_send_attempts - 1:
+                        print("[orchestrator] ⏳ Waiting 15s for workers to recover...")
+                        time.sleep(15)
+                        
+                        alive_count = len([s for s in self.ctrl_sockets.values() if s is not None])
+                        
+                        if alive_count == 0:
+                            print("[orchestrator] ❌ No workers alive, aborting training")
+                            self._emergency_checkpoint()
+                            return
+                        elif alive_count < self.cfg.num_workers:
+                            print(f"[orchestrator] ⚠️ Only {alive_count}/{self.cfg.num_workers} workers alive")
+                            print(f"[orchestrator] 🔄 Attempting retry with partial worker set...")
+                            continue
+                        else:
+                            print(f"[orchestrator] ✅ All {alive_count} workers alive, retrying...")
+                            continue
+                    else:
+                        # Final attempt failed
+                        print("[orchestrator] ❌ All send attempts exhausted")
+                        
+                        # Give one last grace period
+                        print("[orchestrator] ⏳ Final 30s grace period for workers...")
+                        time.sleep(30)
+                        
+                        alive_count = len([s for s in self.ctrl_sockets.values() if s is not None])
+                        if alive_count == 0:
+                            print("[orchestrator] ❌ No workers alive, aborting training")
+                            self._emergency_checkpoint()
+                            return
+                        else:
+                            print(f"[orchestrator] ⚠️ {alive_count} workers alive but step failed, continuing to next batch...")
+                            # Don't abort - try next batch
+                            break
+                
+                if not step_success:
+                    print(f"[orchestrator] ⚠️ Step {self.global_step} failed after all attempts, skipping...")
+                    continue
 
-                # Drain and print worker metrics
+                # ✅ SUCCESS: Drain metrics
                 for m in self._drain_metrics():
                     if m.get("loss") is not None:
-                        print(
-                            f"[step {m['step']}] "
-                            f"gpu{m['gpu_id']} loss={m['loss']:.4f}"
-                        )
+                        print(f"[step {m['step']}] gpu{m['gpu_id']} loss={m['loss']:.4f}")
 
-                # Periodic validation on orchestrator CPU model
+                # Validation
                 if val_loader is not None and (self.global_step % val_interval == 0):
-                    val_loss = self._run_validation(val_loader)
-                    print(f"[val @ step {self.global_step}] loss={val_loss:.4f}")
+                    try:
+                        val_loss = self._run_validation(val_loader)
+                        print(f"[val @ step {self.global_step}] loss={val_loss:.4f}")
+                    except Exception as e:
+                        print(f"[orchestrator] ⚠️ Validation failed: {e}")
+                        # Continue training even if validation fails
+
+            print(f"[orchestrator] ✅ Epoch {epoch+1} completed")
+
+    @track_errors(severity=ErrorSeverity.CRITICAL, reraise=False)
+    def _emergency_checkpoint(self) -> None:
+        """Save model state when training is interrupted."""
+        if self.model is None:
+            return
+        
+        ckpt_path = os.path.join(
+            self.cfg.checkpoint_dir,
+            f"emergency_step{self.global_step}.pt"
+        )
+        self.save_checkpoint(ckpt_path)
+        print(f"[orchestrator] 💾 Emergency checkpoint saved: {ckpt_path}")
+        self.shutdown()
 
     # ---------------------------------------------------------------------
     # Pipeline/model-parallel training loop
@@ -316,6 +482,7 @@ class Orchestrator:
                     val_loss = self._run_validation(val_loader)
                     print(f"[val @ step {self.global_step}] loss={val_loss:.4f}")
 
+    @track_errors(severity=ErrorSeverity.CRITICAL)
     def _pipeline_single_step(
         self,
         input_ids: torch.Tensor,
@@ -408,6 +575,7 @@ class Orchestrator:
     # ---------------------------------------------------------------------
     # Validation (on orchestrator CPU copy)
     # ---------------------------------------------------------------------
+    @track_errors(severity=ErrorSeverity.WARNING, reraise=False)
     @torch.no_grad()
     def _run_validation(self, val_loader: Iterable) -> float:
         """
@@ -442,8 +610,8 @@ class Orchestrator:
         Spin up background servers:
           +0 : control/register/ACKs/BACKWARD_READY  (long-lived per worker)
           +1 : metrics uploads (METRICS_STEP)
-          +2 : gradient uploads (GRADIENTS_UPLOAD)
-          +7 : checkpoint uploads (CHECKPOINT_SHARD_UPLOAD)
+          +2 : gradient uploads (PERSISTENT per worker)
+          +7 : checkpoint uploads (PERSISTENT per worker)
 
         Ports +3,+4,+5,+6 are reserved (activation relay, heartbeats, etc.).
         """
@@ -463,6 +631,14 @@ class Orchestrator:
         lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         optimize_socket_for_network(lsock)
         lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # ✅ macOS CRITICAL: SO_REUSEPORT allows reuse of ports after crash
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass  # Not available on all platforms
+        
         lsock.bind((self.cfg.master_ip, self.cfg.master_port + port_offset))
         lsock.listen()
         return lsock
@@ -509,41 +685,115 @@ class Orchestrator:
     ) -> None:
         """
         Manage a single worker's control socket for its lifetime.
+        NOW WITH: proper reconnection state cleanup
         """
         optimize_socket_for_network(conn)
 
         try:
-            # STEP 1: expect CONTROL_HELLO to register this worker.
-            hello_msg = MessageProtocol.receive_message(conn, timeout=None)
+            # STEP 1: expect CONTROL_HELLO to register this worker
+            hello_msg = MessageProtocol.receive_message(conn, timeout=None, channel_name="orchestrator-ctrl-hello")
             if hello_msg is None or hello_msg.msg_type != MessageType.CONTROL_HELLO:
                 conn.close()
                 return
 
-            hello = hello_msg.payload  # {gpu_id,start_layer,end_layer,hostname}
+            hello = hello_msg.payload
             gpu_id = int(hello["gpu_id"])
-
+            is_reconnect = hello.get("reconnect", False)
+            worker_last_step = hello.get("last_step", -1)
+            
+            if is_reconnect:
+                print(f"[orchestrator] 🔄 GPU{gpu_id} RECONNECTING from {addr} (was at step {worker_last_step})")
+                
+                # ✅ NEW: Track reconnection count
+                if not hasattr(self, 'worker_reconnect_count'):
+                    self.worker_reconnect_count = {}
+                self.worker_reconnect_count[gpu_id] = self.worker_reconnect_count.get(gpu_id, 0) + 1
+                print(f"[orchestrator] 🔄 GPU{gpu_id} reconnection #{self.worker_reconnect_count[gpu_id]}")
+                
+                # ✅ CRITICAL: Clean up stale state for this worker
+                with self.gradients_lock:
+                    old_grads = self.collected_gradients.pop(gpu_id, None)
+                    if old_grads:
+                        print(f"[orchestrator] 🧹 Cleared {len(old_grads)} stale gradients for GPU{gpu_id}")
+                
+                with self._backward_lock:
+                    if gpu_id in self._backward_ready_queues:
+                        old_count = len(self._backward_ready_queues[gpu_id])
+                        self._backward_ready_queues[gpu_id].clear()
+                        if old_count > 0:
+                            print(f"[orchestrator] 🧹 Cleared {old_count} stale BACKWARD_READY msgs for GPU{gpu_id}")
+                    
+                    # Remove from resend list if present
+                    if hasattr(self, '_resend_needed'):
+                        if gpu_id in self._resend_needed:
+                            self._resend_needed.discard(gpu_id)
+                            print(f"[orchestrator] 🧹 Removed GPU{gpu_id} from resend list")
+                
+                print(f"[orchestrator] ✅ GPU{gpu_id} state cleaned for reconnection")
+            else:
+                print(f"[orchestrator] ✅ GPU{gpu_id} initial registration from {addr}")
+            
+            # Record worker info (or update if reconnecting)
             self.registered_workers[gpu_id] = hello
             self.ctrl_sockets[gpu_id] = conn
 
-            # init BACKWARD_READY FIFO list for this worker
+            # Init/reset BACKWARD_READY queue
             with self._backward_lock:
                 self._backward_ready_queues[gpu_id] = []
 
-            print(f"[orchestrator] registered worker GPU {gpu_id} from {addr}")
+            # STEP 2: build the ACK payload
 
-            # STEP 2: send CONTROL_ACK(status='registered')
+            model_config_payload = {
+                "d_model":      self.cfg.d_model,
+                "n_layers":     self.cfg.n_layers,
+                "n_heads":      self.cfg.n_heads,
+                "vocab_size":   self.cfg.vocab_size,
+                "max_seq_len":  self.cfg.max_seq_len,
+                "dropout":      self.cfg.dropout,
+                "batch_size":   self.cfg.batch_size,
+                "max_grad_norm": self.cfg.max_grad_norm,
+            }
+
+            # dynamic model shipping
+            model_class_name  = getattr(self.cfg, "model_class_name", None)
+            model_source_code = getattr(self.cfg, "model_source_code", None)
+            model_init_kwargs = getattr(self.cfg, "model_init_kwargs", None)
+
+            # ✅ NEW: Include current state in ACK
             ack_msg = Message(
                 msg_type=MessageType.CONTROL_ACK,
-                payload={"status": "registered", "gpu_id": gpu_id},
+                payload={
+                    "status": "registered",
+                    "gpu_id": gpu_id,
+                    "model_config": model_config_payload,
+                    "model_class_name":  model_class_name,
+                    "model_source_code": model_source_code,
+                    "model_init_kwargs": model_init_kwargs,
+                    "current_step": self.global_step,  # ✅ NEW: Sync step counter
+                    "is_reconnect": is_reconnect,      # ✅ NEW: Confirm reconnection
+                },
                 gpu_id=gpu_id,
             )
-            MessageProtocol.send_message(conn, ack_msg)
 
-            # STEP 3: poll loop for control messages from worker
+            # Send the ACK over the control socket
+            MessageProtocol.send_message(conn, ack_msg)
+            
+            if is_reconnect:
+                print(f"[orchestrator] 📡 Sent reconnection ACK to GPU{gpu_id} (current step: {self.global_step})")
+                try:
+                    ready_msg = MessageProtocol.receive_message(conn, timeout=30.0)
+                    if ready_msg and ready_msg.msg_type == MessageType.CONTROL_ACK:
+                        print(f"[orchestrator] ✅ GPU{gpu_id} confirmed ready after reconnection")
+                    else:
+                        print(f"[orchestrator] ⚠️ GPU{gpu_id} did not confirm readiness")
+                except Exception as e:
+                    print(f"[orchestrator] ⚠️ GPU{gpu_id} readiness check failed: {e}")
+
+            # STEP 3: enter receive loop for ongoing control messages from worker
             conn.settimeout(0.1)
             while not self._shutdown_flag.is_set():
                 try:
-                    in_msg = MessageProtocol.receive_message(conn, timeout=0.1)
+                    in_msg = MessageProtocol.receive_message(conn, timeout=0.1, channel_name=f"orchestrator-ctrl[GPU{gpu_id}]")
 
                     if in_msg is None:
                         # worker closed cleanly
@@ -557,35 +807,50 @@ class Orchestrator:
                             if isinstance(in_msg.payload, dict)
                             else "unknown"
                         )
-                        print(
-                            f"[orchestrator] ACK from GPU{gpu_id} "
-                            f"cmd={cmd_type} step={step}"
-                        )
+                        # print(f"[orchestrator] ACK from GPU{gpu_id} cmd={cmd_type} step={step}")
 
                     # Heartbeat (liveness ping)
                     elif in_msg.msg_type == MessageType.CONTROL_HEARTBEAT:
-                        # could mark alive/last_seen here
+                        # could update last_seen timestamp etc.
                         pass
 
-                    # BACKWARD_READY:
-                    # Worker finished backward(), uploaded grads, and is
-                    # telling us "here's upstream_grad for the previous shard".
+                    # BACKWARD_READY: worker finished backward() and uploaded grads
                     elif in_msg.msg_type == MessageType.BACKWARD_READY:
                         with self._backward_lock:
                             self._backward_ready_queues[gpu_id].append(in_msg)
 
+                    # ✅ NEW: Handle resend requests from workers
+                    elif in_msg.msg_type == MessageType.CONTROL_RESEND_REQUEST:
+                        reason = in_msg.payload.get("reason", "unknown") if in_msg.payload else "unknown"
+                        step = in_msg.step if in_msg.step is not None else "?"
+                        print(f"[orchestrator] 🔄 GPU{gpu_id} requests resend for step {step} (reason: {reason})")
+                        
+                        # Flag this worker as needing the current batch resent
+                        with self._backward_lock:
+                            if not hasattr(self, '_resend_needed'):
+                                self._resend_needed = set()
+                            self._resend_needed.add(gpu_id)
+                        
+                        # Also clear any stale gradients from this worker
+                        with self.gradients_lock:
+                            self.collected_gradients.pop(gpu_id, None)
+
                     else:
-                        # future message types land here
+                        # future/experimental msg types land here
                         pass
 
                 except socket.timeout:
+                    continue
+                except MessageCorruptedError:
+                    # Orchestrator got corrupt data from worker - just log and continue
+                    print(f"[orchestrator] ⚠️ Corrupt data from GPU{gpu_id}, ignoring")
                     continue
                 except (ConnectionResetError, ConnectionAbortedError):
                     break
 
         finally:
-            # We DO NOT close conn here on purpose.
-            # We keep the socket as long as it's alive in ctrl_sockets[gpu_id].
+            # We intentionally don't close the socket here because
+            # ctrl_sockets[gpu_id] is our live channel to that worker.
             pass
 
     # ---------------------------------------------------------------------
@@ -615,7 +880,8 @@ class Orchestrator:
 
     def _handle_metrics_conn(self, conn: socket.socket) -> None:
         try:
-            msg = MessageProtocol.receive_message(conn, timeout=None)
+            msg = MessageProtocol.receive_message(conn, timeout=None, channel_name="orchestrator-metrics"
+)
             if msg is not None and msg.msg_type == MessageType.METRICS_STEP:
                 with self.metrics_lock:
                     self.collected_metrics.append(msg.payload)
@@ -623,109 +889,249 @@ class Orchestrator:
             conn.close()
 
     # ---------------------------------------------------------------------
-    # GRADIENT SERVER (+2)
+    # GRADIENT SERVER (+2) - PERSISTENT CHANNEL
     # ---------------------------------------------------------------------
     def _grad_server(self) -> None:
         """
-        Workers connect, send one GRADIENTS_UPLOAD Message, then close.
-
-        Message payload:
-            {
-                "gradients": {
-                    "<param_name>": torch.Tensor (CPU),
-                    ...
-                }
-            }
-        Message.gpu_id tells us which worker sent them.
+        Accept PERSISTENT gradient upload connections.
+        Each worker connects once at startup, sends hello, then connection
+        stays open for the entire training session.
         """
         lsock = self._bind_listen(2)
         print(
-            f"[orchestrator] grad_server listening on "
+            f"[orchestrator] grad_server (persistent) listening on "
             f"{self.cfg.master_ip}:{self.cfg.master_port}+2"
         )
 
         while not self._shutdown_flag.is_set():
             try:
-                conn, _ = lsock.accept()
+                conn, addr = lsock.accept()
             except OSError:
                 break
 
+            # Spawn thread to handle this worker's persistent gradient stream
             threading.Thread(
-                target=self._handle_grad_conn,
-                args=(conn,),
+                target=self._handle_grad_conn_persistent,
+                args=(conn, addr),
                 daemon=True,
             ).start()
 
-    def _handle_grad_conn(self, conn: socket.socket) -> None:
+    def _handle_grad_conn_persistent(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        """
+        Handle ONE worker's persistent gradient upload channel.
+        
+        Flow:
+        1. Receive hello handshake with gpu_id
+        2. Store socket in self.grad_sockets[gpu_id]
+        3. Loop forever receiving GRADIENTS_UPLOAD messages
+        4. When connection dies or shutdown, clean up
+        """
+        optimize_socket_for_network(conn)
+        gpu_id = None
+        
         try:
-            msg = MessageProtocol.receive_message(conn, timeout=None)
-            if msg is None or msg.msg_type != MessageType.GRADIENTS_UPLOAD:
+            # STEP 1: Expect hello handshake
+            conn.settimeout(10.0)  # 10s timeout for initial hello
+            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-gradients-hello"
+)
+            
+            if hello_msg is None or hello_msg.msg_type != MessageType.GRADIENTS_UPLOAD:
+                print(f"[orchestrator] grad channel from {addr}: invalid hello")
                 conn.close()
                 return
-
-            gpu_id = int(msg.gpu_id if msg.gpu_id is not None else -1)
-            grads_dict = msg.payload.get("gradients", {})
-
-            with self.gradients_lock:
-                self.collected_gradients[gpu_id] = grads_dict
+            
+            # Extract gpu_id from hello
+            if isinstance(hello_msg.payload, dict) and hello_msg.payload.get("hello"):
+                gpu_id = int(hello_msg.gpu_id if hello_msg.gpu_id is not None else -1)
+            else:
+                print(f"[orchestrator] grad channel from {addr}: missing hello flag")
+                conn.close()
+                return
+            
+            # STEP 2: Store persistent socket
+            with self.grad_sockets_lock:
+                self.grad_sockets[gpu_id] = conn
+            
+            print(f"[orchestrator] ✅ persistent gradient channel established for GPU{gpu_id} from {addr}")
+            
+            # STEP 3: Loop forever receiving gradients
+            conn.settimeout(0.5)  # Short timeout for loop polling
+            while not self._shutdown_flag.is_set():
+                try:
+                    msg = MessageProtocol.receive_message(conn, timeout=0.5, channel_name=f"orchestrator-gradients[GPU{gpu_id}]")
+                    
+                    if msg is None:
+                        # Worker closed cleanly
+                        print(f"[orchestrator] GPU{gpu_id} gradient channel closed by worker")
+                        break
+                    
+                    if msg.msg_type == MessageType.GRADIENTS_UPLOAD:
+                        # Extract gradients and store them
+                        grads_dict = msg.payload.get("gradients", {})
+                        
+                        with self.gradients_lock:
+                            self.collected_gradients[gpu_id] = grads_dict
+                        
+                        # Optional: log occasionally
+                        # print(f"[orchestrator] received grads from GPU{gpu_id} step={msg.step}")
+                    
+                    elif msg.msg_type == MessageType.CONTROL_HEARTBEAT:
+                        # Keep-alive ping, just ignore
+                        pass
+                    
+                except socket.timeout:
+                    # Normal - just poll again
+                    continue
+                
+                except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                    print(f"[orchestrator] GPU{gpu_id} gradient channel error: {e}")
+                    break
+            
+        except Exception as e:
+            print(f"[orchestrator] gradient channel exception from {addr}: {e}")
+        
         finally:
-            conn.close()
+            # STEP 4: Cleanup
+            if gpu_id is not None:
+                with self.grad_sockets_lock:
+                    self.grad_sockets.pop(gpu_id, None)
+                print(f"[orchestrator] GPU{gpu_id} gradient channel cleaned up")
+            
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------------
-    # CHECKPOINT SERVER (+7)
+    # CHECKPOINT SERVER (+7) - PERSISTENT CHANNEL
     # ---------------------------------------------------------------------
     def _checkpoint_server(self) -> None:
         """
-        Workers connect to +7 at shutdown and send CHECKPOINT_SHARD_UPLOAD.
-        Orchestrator persists shard weights to disk.
+        Accept PERSISTENT checkpoint upload connections.
         """
         lsock = self._bind_listen(7)
         print(
-            f"[orchestrator] checkpoint_server listening on "
+            f"[orchestrator] checkpoint_server (persistent) listening on "
             f"{self.cfg.master_ip}:{self.cfg.master_port}+7"
         )
 
         while not self._shutdown_flag.is_set():
             try:
-                conn, _ = lsock.accept()
+                conn, addr = lsock.accept()
             except OSError:
                 break
 
             threading.Thread(
-                target=self._handle_checkpoint_conn,
-                args=(conn,),
+                target=self._handle_checkpoint_conn_persistent,
+                args=(conn, addr),
                 daemon=True,
             ).start()
 
-    def _handle_checkpoint_conn(self, conn: socket.socket) -> None:
+    def _handle_checkpoint_conn_persistent(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        """
+        Handle ONE worker's persistent checkpoint upload channel.
+        NOW WITH: proper reconnection handling
+        """
+        optimize_socket_for_network(conn)
+        gpu_id = None
+        
         try:
-            msg = MessageProtocol.receive_message(conn, timeout=None)
-            if msg is None or msg.msg_type != MessageType.CHECKPOINT_SHARD_UPLOAD:
+            # STEP 1: Expect hello handshake
+            conn.settimeout(10.0)
+            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-checkpoint-hello"
+)
+            
+            if hello_msg is None or hello_msg.msg_type != MessageType.CHECKPOINT_SHARD_UPLOAD:
+                print(f"[orchestrator] checkpoint channel from {addr}: invalid hello")
                 conn.close()
                 return
+            
+            if isinstance(hello_msg.payload, dict) and hello_msg.payload.get("hello"):
+                gpu_id = int(hello_msg.gpu_id if hello_msg.gpu_id is not None else -1)
+                is_reconnect = hello_msg.payload.get("reconnect", False)  # ✅ NEW
+            else:
+                print(f"[orchestrator] checkpoint channel from {addr}: missing hello flag")
+                conn.close()
+                return
+            
+            # ✅ NEW: Handle reconnection
+            if is_reconnect:
+                print(f"[orchestrator] 🔄 GPU{gpu_id} checkpoint channel RECONNECTING from {addr}")
+            
+            # STEP 2: Store persistent socket
+            with self.chkpt_sockets_lock:
+                # ✅ NEW: Close old socket if exists
+                old_sock = self.chkpt_sockets.get(gpu_id)
+                if old_sock is not None and old_sock != conn:
+                    try:
+                        old_sock.close()
+                        print(f"[orchestrator] 🧹 Closed stale checkpoint socket for GPU{gpu_id}")
+                    except Exception:
+                        pass
+                
+                self.chkpt_sockets[gpu_id] = conn
+            
+            status = "reconnected" if is_reconnect else "established"
+            print(f"[orchestrator] ✅ checkpoint channel {status} for GPU{gpu_id} from {addr}")
 
-            payload = msg.payload or {}
-            gpu_id = payload.get("gpu_id", msg.gpu_id)
-            filename = payload.get("filename", f"worker{gpu_id}_final.pt")
-            state_dict = payload.get("state_dict")
-
-            os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
-            out_path = os.path.join(self.cfg.checkpoint_dir, filename)
-            torch.save(state_dict, out_path)
-            print(f"[orchestrator] got checkpoint from GPU{gpu_id} -> {out_path}")
-
-            # Best-effort single-byte "OK" so worker can log it
+            
+            # STEP 3: Loop receiving checkpoints (usually just one at end of training)
+            conn.settimeout(0.5)
+            while not self._shutdown_flag.is_set():
+                try:
+                    msg = MessageProtocol.receive_message(conn, timeout=0.5, channel_name=f"orchestrator-checkpoint[GPU{gpu_id}]"
+)
+                    
+                    if msg is None:
+                        print(f"[orchestrator] GPU{gpu_id} checkpoint channel closed by worker")
+                        break
+                    
+                    if msg.msg_type == MessageType.CHECKPOINT_SHARD_UPLOAD:
+                        payload = msg.payload or {}
+                        filename = payload.get("filename", f"worker{gpu_id}_final.pt")
+                        state_dict = payload.get("state_dict")
+                        
+                        if state_dict is not None:
+                            os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+                            out_path = os.path.join(self.cfg.checkpoint_dir, filename)
+                            torch.save(state_dict, out_path)
+                            print(f"[orchestrator] checkpoint from GPU{gpu_id} -> {out_path}")
+                            
+                            # Send ACK back
+                            try:
+                                conn.sendall(b"\x01")
+                            except Exception:
+                                pass
+                    
+                    elif msg.msg_type == MessageType.CONTROL_HEARTBEAT:
+                        # Keep-alive ping
+                        pass
+                    
+                except socket.timeout:
+                    continue
+                
+                except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                    print(f"[orchestrator] GPU{gpu_id} checkpoint channel error: {e}")
+                    break
+            
+        except Exception as e:
+            print(f"[orchestrator] checkpoint channel exception from {addr}: {e}")
+        
+        finally:
+            if gpu_id is not None:
+                with self.chkpt_sockets_lock:
+                    self.chkpt_sockets.pop(gpu_id, None)
+                print(f"[orchestrator] GPU{gpu_id} checkpoint channel cleaned up")
+            
             try:
-                conn.sendall(b"\x01")
+                conn.close()
             except Exception:
                 pass
-
-        finally:
-            conn.close()
 
     # ---------------------------------------------------------------------
     # Training helpers
     # ---------------------------------------------------------------------
+    @track_errors(context="orchestrator.broadcast_ctrl", severity=ErrorSeverity.CRITICAL)
     def _broadcast_ctrl(self, msg: Message) -> None:
         """
         Send the same Message to EVERY registered worker via its control socket.
@@ -742,7 +1148,8 @@ class Orchestrator:
         for gpu_id in dead:
             self.ctrl_sockets.pop(gpu_id, None)
             self.registered_workers.pop(gpu_id, None)
-
+    
+    @track_errors(context="orchestrator.send_ctrl_to", severity=ErrorSeverity.CRITICAL)
     def _send_ctrl_to(self, gpu_id: int, msg: Message) -> None:
         """
         Send one Message to one specific worker (used for:
@@ -793,36 +1200,120 @@ class Orchestrator:
         In both cases now, it's num_workers.
         """
         return max(self.cfg.num_workers, 1)
-
-    def _aggregate_and_step(self, pipeline_mode: bool = False) -> None:
+    
+    @track_errors(context="orchestrator.aggregate_and_step", severity=ErrorSeverity.ERROR)
+    def _aggregate_and_step(self, pipeline_mode: bool = False, timeout: float = 300.0, max_retries: int = 3) -> bool:
         """
-        Gradient sync + optimizer step:
-          1. Wait for expected GRADIENTS_UPLOAD messages.
-          2. Average grads across workers per param name.
-          3. Load averaged grads into master model.
-          4. optimizer.step() on orchestrator.
+        Gradient sync + optimizer step with timeout and retry logic for missing workers.
+        
+        Returns:
+            True if step succeeded, False if we should abort training
         """
         assert self.model is not None
         assert self.optimizer is not None
 
         expected_workers = self._expected_grad_senders(pipeline_mode)
+        
+        for retry_attempt in range(max_retries):
+            # Wait with timeout for gradient uploads
+            start_time = time.time()
+            timed_out = False
+            
+            while True:
+                with self.gradients_lock:
+                    ready = len(self.collected_gradients) >= expected_workers
+                    current_count = len(self.collected_gradients)
+                
+                if ready:
+                    break
+                    
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    print(f"[orchestrator] ⚠️ TIMEOUT on retry {retry_attempt + 1}/{max_retries} after {elapsed:.1f}s")
+                    print(f"[orchestrator] Expected {expected_workers} workers, got {current_count}")
+                    
+                    # Check which workers are missing
+                    with self.gradients_lock:
+                        present = set(self.collected_gradients.keys())
+                    expected_set = set(range(self.cfg.num_workers))
+                    missing = expected_set - present
+                    
+                    print(f"[orchestrator] Missing gradients from GPUs: {missing}")
+                    
+                    # Check if control sockets are still alive
+                    dead_workers = []
+                    alive_workers = []
+                    for gpu_id in missing:
+                        sock = self.ctrl_sockets.get(gpu_id)
+                        if sock is None:
+                            dead_workers.append(gpu_id)
+                            continue
+                            
+                        # Try to ping the worker
+                        try:
+                            ping = Message(
+                                msg_type=MessageType.CONTROL_HEARTBEAT,
+                                gpu_id=gpu_id,
+                            )
+                            MessageProtocol.send_message(sock, ping, compress=False)
+                            alive_workers.append(gpu_id)
+                        except Exception as e:
+                            print(f"[orchestrator] Failed to ping GPU{gpu_id}: {e}")
+                            dead_workers.append(gpu_id)
+                    
+                    if dead_workers:
+                        print(f"[orchestrator] 💀 Dead workers detected: {dead_workers}")
+                        
+                        # On final retry, abort. Otherwise, clear gradients and retry
+                        if retry_attempt < max_retries - 1:
+                            wait_time = min(15 * (retry_attempt + 1), 120)  # 15s, 30s, 45s... cap at 120s
+                            print(f"[orchestrator] ⏳ Waiting {wait_time}s for workers to reconnect...")
+                            time.sleep(wait_time)  # INCREASED from 5-30s
+                        else:
+                            print(f"[orchestrator] 🔄 Clearing stale gradients and waiting for reconnection...")
+                            with self.gradients_lock:
+                                self.collected_gradients.clear()
+                            
+                            # Wait for workers to reconnect (exponential backoff)
+                            wait_time = min(5 * (retry_attempt + 1), 30)  # 5s, 10s, 30s max
+                            print(f"[orchestrator] ⏳ Waiting {wait_time}s for workers to reconnect...")
+                            time.sleep(wait_time)
+                            
+                            timed_out = True
+                            break  # Break inner loop to start next retry
+                    else:
+                        # Workers are alive but slow - extend timeout for this retry
+                        print(f"[orchestrator] Workers {alive_workers} are alive but slow, extending wait...")
+                        time.sleep(2.0)
+                        continue
+                        
+                time.sleep(0.01)
+            
+            # If we timed out and need to retry, continue outer loop
+            if timed_out:
+                continue
+            
+            # SUCCESS: We have all gradients, proceed with aggregation
+            break
+        
+        else:
+            # All retries exhausted (loop completed without break)
+            print(f"[orchestrator] ❌ Failed to collect gradients after {max_retries} retries")
+            return False
 
-        # Wait until we have ALL expected gradient uploads
-        while True:
-            with self.gradients_lock:
-                ready = len(self.collected_gradients) >= expected_workers
-            if ready:
-                break
-            time.sleep(0.01)
-
+        # ============= AGGREGATION (SUCCESSFUL PATH) ============= #
+        
         # Snapshot + clear buffer
         with self.gradients_lock:
             per_gpu_grads = self.collected_gradients
             self.collected_gradients = {}
 
+        print(f"[orchestrator] ✅ Collected gradients from {len(per_gpu_grads)} workers")
+
         # Group grads by param name
         stacked: Dict[str, List[torch.Tensor]] = {}
-        for _, grad_dict in per_gpu_grads.items():
+        for gpu_id, grad_dict in per_gpu_grads.items():
             for pname, g in grad_dict.items():
                 stacked.setdefault(pname, []).append(g)
 
@@ -836,7 +1327,10 @@ class Orchestrator:
         for (pname, param) in self.model.named_parameters():
             if pname in avg_grads:
                 param.grad = avg_grads[pname].to(param.device).clone()
+        
         self.optimizer.step()
+        
+        return True  # Success
 
     def _drain_metrics(self) -> List[Dict[str, Any]]:
         """
@@ -846,127 +1340,55 @@ class Orchestrator:
             out = self.collected_metrics
             self.collected_metrics = []
         return out
-
-
-
-# =====================================================================
-# Tensor-Parallel Collectives (Megatron-style intra-layer synchronization)
-# =====================================================================
-
-import pickle
-import zlib
-from .socket_utils import send_with_size, recv_with_size
-from .protocol import MessageType
-
-
-    # -----------------------------------------------------------------
-    # Tensor-parallel helper methods
-    # -----------------------------------------------------------------
-
-def get_tensor_peers(self, gpu_id: int) -> list[int]:
+    
+    def shutdown(self) -> None:
         """
-        Return list of peer GPU IDs that share the same tensor-parallel group.
-        Example: tensor_parallel_size = 2 → groups [0,1], [2,3], ...
+        Graceful shutdown - release ports, close sockets, stop threads.
+        Call this when training finishes or on error.
         """
-        tp = getattr(self.cfg, "tensor_parallel_size", 1)
-        if tp <= 1:
-            return [gpu_id]
-        base = gpu_id - (gpu_id % tp)
-        return [base + i for i in range(tp)]
-
-def _serialize_tensor(self, tensor: torch.Tensor) -> bytes:
-        """CPU→bytes (compressed)"""
-        return zlib.compress(pickle.dumps(tensor.cpu(), protocol=4))
-
-def _deserialize_tensor(self, data: bytes) -> torch.Tensor:
-        """bytes→Tensor (GPU if available)"""
-        t = pickle.loads(zlib.decompress(data))
-        return t.cuda() if torch.cuda.is_available() else t
-
-    # -----------------------------------------------------------------
-    # Collective operations (pure socket, no torch.distributed)
-    # -----------------------------------------------------------------
-
-def collect_tensor(self, gpu_id: int, tensor: torch.Tensor) -> list[torch.Tensor]:
-        """
-        All-gather partial outputs from all peers of this layer group.
-        Each peer computes Y_chunk = X @ W_chunk.
-        We collect all Y_chunk → full Y.
-        """
-        peers = self.get_tensor_peers(gpu_id)
-        if len(peers) == 1:
-            return [tensor]
-
-        payload = self._serialize_tensor(tensor)
-        results: list[torch.Tensor] = []
-
-        for peer in peers:
-            sock = self.ctrl_sockets.get(peer)
-            if sock is None:
-                continue
-            msg = Message(
-                msg_type=MessageType.TENSOR_FORWARD_GATHER,
-                gpu_id=gpu_id,
-                step=self.global_step,
-            )
-            # send header first
-            MessageProtocol.send_message(sock, msg)
-            send_with_size(sock, payload)
-            # wait for peer's response tensor
-            data = recv_with_size(sock)
-            results.append(self._deserialize_tensor(data))
-
-        return results
-
-def reduce_tensor(self, gpu_id: int, grad: torch.Tensor) -> torch.Tensor:
-        """
-        All-reduce (average) gradients across tensor-parallel peers.
-        Each peer computes its local dX_chunk;
-        we average them to build full dLoss/dX.
-        """
-        peers = self.get_tensor_peers(gpu_id)
-        if len(peers) == 1:
-            return grad
-
-        payload = self._serialize_tensor(grad)
-        collected = [grad]
-
-        for peer in peers:
-            sock = self.ctrl_sockets.get(peer)
-            if sock is None:
-                continue
-            msg = Message(
-                msg_type=MessageType.TENSOR_BACKWARD_REDUCE,
-                gpu_id=gpu_id,
-                step=self.global_step,
-            )
-            MessageProtocol.send_message(sock, msg)
-            send_with_size(sock, payload)
-            data = recv_with_size(sock)
-            collected.append(self._deserialize_tensor(data))
-
-        # average
-        return sum(collected) / len(collected)
-
-def tensor_sync_barrier(self, gpu_id: int) -> None:
-        """
-        Simple synchronization barrier across tensor-parallel peers.
-        Ensures all peers reached the same step boundary before continuing.
-        """
-        peers = self.get_tensor_peers(gpu_id)
-        if len(peers) == 1:
-            return
-        for peer in peers:
-            sock = self.ctrl_sockets.get(peer)
-            if sock is None:
-                continue
-            msg = Message(
-                msg_type=MessageType.TENSOR_SYNC_BARRIER,
-                gpu_id=gpu_id,
-                step=self.global_step,
-            )
-            MessageProtocol.send_message(sock, msg)
+        print(f"[orchestrator] 🛑 Starting graceful shutdown...")
+        
+        # ✅ 1. Release ports FIRST (so they're immediately available)
+        if self._port_manager is not None:
+            job_name = getattr(self.cfg, 'job_name', 'unknown')
             try:
-                sock.recv(2)  # expect short 'OK'
-            except Exception:
-                pass
+                self._port_manager.release_port_range(job_name)
+                print(f"[orchestrator] 🔓 Ports released for job '{job_name}'")
+            except Exception as e:
+                print(f"[orchestrator] ⚠️ Port release failed: {e}")
+        
+        # ✅ 2. Signal shutdown to all background threads
+        self._shutdown_flag.set()
+        
+        # ✅ 3. Close all worker control sockets
+        for gpu_id, sock in list(self.ctrl_sockets.items()):
+            try:
+                sock.close()
+                print(f"[orchestrator] Closed control socket for GPU{gpu_id}")
+            except Exception as e:
+                print(f"[orchestrator] Error closing ctrl socket GPU{gpu_id}: {e}")
+        
+        # ✅ 4. Close persistent gradient sockets
+        with self.grad_sockets_lock:
+            for gpu_id, sock in list(self.grad_sockets.items()):
+                try:
+                    sock.close()
+                    print(f"[orchestrator] Closed gradient socket for GPU{gpu_id}")
+                except Exception as e:
+                    print(f"[orchestrator] Error closing grad socket GPU{gpu_id}: {e}")
+        
+        # ✅ 5. Close persistent checkpoint sockets
+        with self.chkpt_sockets_lock:
+            for gpu_id, sock in list(self.chkpt_sockets.items()):
+                try:
+                    sock.close()
+                    print(f"[orchestrator] Closed checkpoint socket for GPU{gpu_id}")
+                except Exception as e:
+                    print(f"[orchestrator] Error closing chkpt socket GPU{gpu_id}: {e}")
+        
+        # ✅ 6. Join listener threads (give them 5s to finish)
+        for t in self._listener_threads:
+            if t.is_alive():
+                t.join(timeout=5.0)
+        
+        print(f"[orchestrator] ✅ Graceful shutdown complete")
