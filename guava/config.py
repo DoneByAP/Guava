@@ -44,6 +44,19 @@ class DistributedConfig:
     weight_decay:    float = 0.01
     max_grad_norm:   float = 1.0
     use_amp:         bool  = False
+    optimizer:       dict  = field(default_factory=lambda: {
+        "target": "torch.optim.AdamW",
+        "params": {},
+    })
+    loss:            dict  = field(default_factory=lambda: {
+        "target": "torch.nn.CrossEntropyLoss",
+        "params": {},
+        "label_key": "labels",
+        "logits_transform": "flatten_last_dim",
+        "labels_transform": "flatten",
+        "call_mode": "logits_labels",
+    })
+    scheduler: Optional[dict] = None
 
     # ---------------- Cluster ----------------
     num_workers:   int    = 1

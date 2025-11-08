@@ -32,13 +32,13 @@ from typing import Any, Dict, Optional, List, Tuple, Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .config import DistributedConfig
 from .socket_utils import optimize_socket_for_network
 from .protocol import MessageType, Message, MessageProtocol
 from .protocol import MessageType, Message, MessageProtocol, MessageCorruptedError
 from .energy_monitor import get_error_tracker, ErrorSeverity, track_errors  # ✅ ADD track_errors
+from .training_components import build_loss_handler, build_optimizer, build_scheduler
 
 class Orchestrator:
     """
@@ -92,6 +92,8 @@ class Orchestrator:
         # Master model + optimizer
         self.model: Optional[nn.Module] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.scheduler: Optional[Any] = None
+        self.loss_handler = build_loss_handler(self.cfg, device=torch.device("cpu"))
 
         # Global training position
         self.global_step = 0
@@ -172,12 +174,14 @@ class Orchestrator:
         """
         self.model = model
         self.model.train(True)
+        self.optimizer = build_optimizer(self.cfg, self.model.parameters())
+        self.scheduler = build_scheduler(self.cfg, self.optimizer)
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.cfg.learning_rate,
-            weight_decay=self.cfg.weight_decay,
-        )
+        try:
+            first_param = next(self.model.parameters())
+            self.loss_handler.set_device(first_param.device)
+        except StopIteration:
+            self.loss_handler.set_device(torch.device("cpu"))
 
     def wait_for_workers(
         self,
@@ -588,14 +592,31 @@ class Orchestrator:
         total_loss = 0.0
         total_tokens = 0
 
+        label_key = getattr(self.loss_handler, "label_key", "labels") if self.loss_handler else "labels"
+
         for (inp_ids, lbls) in val_loader:
             logits = self.model(inp_ids)  # [B,T,V]
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                lbls.view(-1),
-            )
-            n_tok = lbls.numel()
-            total_loss += float(loss.item()) * n_tok
+            batch = {}
+            if lbls is not None:
+                batch[label_key] = lbls
+                if isinstance(lbls, torch.Tensor):
+                    n_tok = lbls.numel()
+                else:
+                    n_tok = torch.as_tensor(lbls).numel()
+            else:
+                if isinstance(inp_ids, torch.Tensor):
+                    n_tok = inp_ids.numel()
+                else:
+                    n_tok = torch.as_tensor(inp_ids).numel()
+
+            loss = None
+            if self.loss_handler is not None:
+                loss = self.loss_handler.compute(logits, batch, device=logits.device)
+
+            if loss is None:
+                continue
+
+            total_loss += float(loss.detach().item()) * n_tok
             total_tokens += n_tok
 
         self.model.train(True)
@@ -623,7 +644,7 @@ class Orchestrator:
         self._listener_threads = [t0, t1, t2, t7]
         for t in self._listener_threads:
             t.start()
-
+                
     def _bind_listen(self, port_offset: int) -> socket.socket:
         """
         Bind and listen on (cfg.master_port + port_offset).
@@ -880,8 +901,7 @@ class Orchestrator:
 
     def _handle_metrics_conn(self, conn: socket.socket) -> None:
         try:
-            msg = MessageProtocol.receive_message(conn, timeout=None, channel_name="orchestrator-metrics"
-)
+            msg = MessageProtocol.receive_message(conn, timeout=None, channel_name="orchestrator-metrics")
             if msg is not None and msg.msg_type == MessageType.METRICS_STEP:
                 with self.metrics_lock:
                     self.collected_metrics.append(msg.payload)
@@ -932,8 +952,7 @@ class Orchestrator:
         try:
             # STEP 1: Expect hello handshake
             conn.settimeout(10.0)  # 10s timeout for initial hello
-            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-gradients-hello"
-)
+            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-gradients-hello")
             
             if hello_msg is None or hello_msg.msg_type != MessageType.GRADIENTS_UPLOAD:
                 print(f"[orchestrator] grad channel from {addr}: invalid hello")
@@ -1038,8 +1057,7 @@ class Orchestrator:
         try:
             # STEP 1: Expect hello handshake
             conn.settimeout(10.0)
-            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-checkpoint-hello"
-)
+            hello_msg = MessageProtocol.receive_message(conn, timeout=10.0, channel_name="orchestrator-checkpoint-hello")
             
             if hello_msg is None or hello_msg.msg_type != MessageType.CHECKPOINT_SHARD_UPLOAD:
                 print(f"[orchestrator] checkpoint channel from {addr}: invalid hello")
@@ -1079,8 +1097,7 @@ class Orchestrator:
             conn.settimeout(0.5)
             while not self._shutdown_flag.is_set():
                 try:
-                    msg = MessageProtocol.receive_message(conn, timeout=0.5, channel_name=f"orchestrator-checkpoint[GPU{gpu_id}]"
-)
+                    msg = MessageProtocol.receive_message(conn, timeout=0.5, channel_name=f"orchestrator-checkpoint[GPU{gpu_id}]")
                     
                     if msg is None:
                         print(f"[orchestrator] GPU{gpu_id} checkpoint channel closed by worker")
@@ -1327,9 +1344,14 @@ class Orchestrator:
         for (pname, param) in self.model.named_parameters():
             if pname in avg_grads:
                 param.grad = avg_grads[pname].to(param.device).clone()
-        
+
         self.optimizer.step()
-        
+        if self.scheduler is not None:
+            try:
+                self.scheduler.step()
+            except TypeError:
+                self.scheduler.step(self.global_step)
+
         return True  # Success
 
     def _drain_metrics(self) -> List[Dict[str, Any]]:

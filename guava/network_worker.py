@@ -434,7 +434,7 @@ class NetworkWorker:
         - exec() that source to define the model class here
         - instantiate it with init_kwargs
         - slice if needed for pipeline/model-parallel
-        - wrap in DataParallelWorker or ModelShardWorker
+        - wrap in DataParallelWorker, ModelShardWorker, or InferenceWorker
         """
         payload    = ack_msg.payload or {}
         model_cfg  = payload.get("model_config", {})
@@ -473,9 +473,12 @@ class NetworkWorker:
                 f"[GPU{self.gpu_id}] init {class_name}{init_kwargs} failed: {e}"
             )
 
+        # Set training mode based on inference_only flag
         model.train(not self._inference_only)
+        
+        # Only require gradients if training
         for p in model.parameters():
-            p.requires_grad_(True)
+            p.requires_grad_(not self._inference_only)
 
         start_layer, end_layer = self._layer_assignment()
         pure_dp = (
@@ -485,26 +488,54 @@ class NetworkWorker:
             and not self.cfg.tensor_parallel
         )
 
+        # ✅ NEW: Choose worker type based on mode
         if pure_dp:
-            w = DataParallelWorker(self.gpu_id, self.cfg)
-            w.register_model(model)
-            print(f"[GPU{self.gpu_id}] ✅ strict DP worker ready")
+            if self._inference_only:
+                # Inference mode: use InferenceWorker
+                from .base_worker import InferenceWorker
+                w = InferenceWorker(
+                    self.gpu_id, 
+                    self.cfg,
+                    use_kv_cache=getattr(self.cfg, "use_kv_cache", False),
+                )
+                w.register_model(model)
+                print(f"[GPU{self.gpu_id}] ✅ strict inference worker ready (data-parallel)")
+            else:
+                # Training mode: use DataParallelWorker
+                w = DataParallelWorker(self.gpu_id, self.cfg)
+                w.register_model(model)
+                print(f"[GPU{self.gpu_id}] ✅ strict DP worker ready")
         else:
+            # Pipeline/model-parallel sharding
             shard_model = self._extract_shard(model, start_layer, end_layer)
-            w = ModelShardWorker(
-                self.gpu_id,
-                self.cfg,
-                layer_start=start_layer,
-                layer_end=end_layer,
-            )
-            w.register_model(shard_model)
-            print(f"[GPU{self.gpu_id}] ✅ strict shard worker [{start_layer}:{end_layer})")
+            
+            if self._inference_only:
+                # Inference mode with sharding: still use InferenceWorker
+                from .base_worker import InferenceWorker
+                w = InferenceWorker(
+                    self.gpu_id, 
+                    self.cfg,
+                    use_kv_cache=getattr(self.cfg, "use_kv_cache", False),
+                )
+                w.register_model(shard_model)
+                print(f"[GPU{self.gpu_id}] ✅ strict inference shard worker [{start_layer}:{end_layer})")
+            else:
+                # Training mode with sharding: use ModelShardWorker
+                w = ModelShardWorker(
+                    self.gpu_id,
+                    self.cfg,
+                    layer_start=start_layer,
+                    layer_end=end_layer,
+                )
+                w.register_model(shard_model)
+                print(f"[GPU{self.gpu_id}] ✅ strict shard worker [{start_layer}:{end_layer})")
 
         w.set_training_mode(not self._inference_only)
         self.worker = w
 
         total_params = sum(p.numel() for p in self.worker.model.parameters())
-        print(f"[GPU{self.gpu_id}] params={total_params:,} (strict mode)")
+        mode_str = "inference" if self._inference_only else "training"
+        print(f"[GPU{self.gpu_id}] params={total_params:,} (strict mode, {mode_str})")
 
         # tell EnergyMonitor what model this GPU is actually running
         if self.energy_monitor:
@@ -521,7 +552,7 @@ class NetworkWorker:
         LEGACY PATH:
         - Use local model_ctor() to make the model
         - Slice if pipeline/model-parallel
-        - Wrap into DataParallelWorker or ModelShardWorker
+        - Wrap into DataParallelWorker, ModelShardWorker, or InferenceWorker
         """
         payload   = ack_msg.payload or {}
         model_cfg = payload.get("model_config", {})
@@ -541,26 +572,54 @@ class NetworkWorker:
             and not self.cfg.tensor_parallel
         )
 
+        # ✅ NEW: Choose worker type based on mode
         if pure_dp:
-            w = DataParallelWorker(self.gpu_id, self.cfg)
-            w.register_model(full_model)
-            print(f"[GPU{self.gpu_id}] ✅ legacy DP worker ready")
+            if self._inference_only:
+                # Inference mode: use InferenceWorker
+                from .base_worker import InferenceWorker
+                w = InferenceWorker(
+                    self.gpu_id, 
+                    self.cfg,
+                    use_kv_cache=getattr(self.cfg, "use_kv_cache", False),
+                )
+                w.register_model(full_model)
+                print(f"[GPU{self.gpu_id}] ✅ legacy inference worker ready (data-parallel)")
+            else:
+                # Training mode: use DataParallelWorker
+                w = DataParallelWorker(self.gpu_id, self.cfg)
+                w.register_model(full_model)
+                print(f"[GPU{self.gpu_id}] ✅ legacy DP worker ready")
         else:
+            # Pipeline/model-parallel sharding
             shard_model = self._extract_shard(full_model, start_layer, end_layer)
-            w = ModelShardWorker(
-                self.gpu_id,
-                self.cfg,
-                layer_start=start_layer,
-                layer_end=end_layer,
-            )
-            w.register_model(shard_model)
-            print(f"[GPU{self.gpu_id}] ✅ legacy shard worker [{start_layer}:{end_layer})")
+            
+            if self._inference_only:
+                # Inference mode with sharding: still use InferenceWorker
+                from .base_worker import InferenceWorker
+                w = InferenceWorker(
+                    self.gpu_id, 
+                    self.cfg,
+                    use_kv_cache=getattr(self.cfg, "use_kv_cache", False),
+                )
+                w.register_model(shard_model)
+                print(f"[GPU{self.gpu_id}] ✅ legacy inference shard worker [{start_layer}:{end_layer})")
+            else:
+                # Training mode with sharding: use ModelShardWorker
+                w = ModelShardWorker(
+                    self.gpu_id,
+                    self.cfg,
+                    layer_start=start_layer,
+                    layer_end=end_layer,
+                )
+                w.register_model(shard_model)
+                print(f"[GPU{self.gpu_id}] ✅ legacy shard worker [{start_layer}:{end_layer})")
 
         w.set_training_mode(not self._inference_only)
         self.worker = w
 
         total_params = sum(p.numel() for p in self.worker.model.parameters())
-        print(f"[GPU{self.gpu_id}] params={total_params:,} (legacy mode)")
+        mode_str = "inference" if self._inference_only else "training"
+        print(f"[GPU{self.gpu_id}] params={total_params:,} (legacy mode, {mode_str})")
 
         # tell EnergyMonitor what model this GPU is actually running
         if self.energy_monitor:
@@ -568,6 +627,7 @@ class NetworkWorker:
                 model_name=getattr(self.cfg, "model_class_name", "unknown_model"),
                 params=total_params,
             )
+        
         # pick a device for THIS worker thread
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{self.gpu_id}")
@@ -584,7 +644,6 @@ class NetworkWorker:
         # backfill worker.device so older code doesn't explode
         if self.worker and not hasattr(self.worker, "device"):
             self.worker.device = self.device
-
     # -------------------------------------------------------------------------
     # PERSISTENT CHANNEL RECONNECT HELPERS
     # -------------------------------------------------------------------------
@@ -1171,6 +1230,10 @@ class NetworkWorker:
                 if mtype == MessageType.ACTIVATION_FRAME:
                     safe_call(self._handle_activation_frame, msg, context="activation", severity=ErrorSeverity.WARNING)
                     continue
+                
+                if mtype == MessageType.CONTROL_INFERENCE_STEP:
+                    safe_call(self._handle_inference_step, msg, context="inference_step", severity=ErrorSeverity.WARNING)
+                    continue                
 
             # Normal teardown
             print(f"[GPU {self.gpu_id}] 🧹 Starting graceful shutdown...")
@@ -1406,7 +1469,7 @@ class NetworkWorker:
         Flow:
         1. tensors -> GPU
         2. forward()  (marked, so we log FLOPs/TFLOPs/s/etc.)
-        3. CE loss
+        3. configurable loss (from config)
         4. backward() (marked, so we log FLOPs/TFLOPs/J)
         5. clip grads, tensor-reduce grads, send grads
         6. local optimizer step
@@ -1454,6 +1517,7 @@ class NetworkWorker:
                 dtype = torch.long  # Default for language models
             
             input_ids = torch.as_tensor(input_ids_raw, dtype=dtype, device=dev)
+        batch["input_ids"] = input_ids
 
         # normalize labels (may be None)
         if labels_raw is not None:
@@ -1464,6 +1528,8 @@ class NetworkWorker:
                 labels = torch.as_tensor(labels_raw, dtype=input_ids.dtype, device=dev)
         else:
             labels = None
+        if labels is not None:
+            batch["labels"] = labels
 
         training_enabled = (phase == "train") and (not self._inference_only)
         self.worker.set_training_mode(training_enabled)
@@ -1480,14 +1546,9 @@ class NetworkWorker:
                     if getattr(self.cfg, "enable_tensor_parallel", False):
                         logits = self.tensor_gather(logits, step)
 
-                    if labels is not None:
-                        loss = F.cross_entropy(
-                            logits.reshape(-1, logits.size(-1)),
-                            labels.reshape(-1),
-                        )
-                        loss_val = float(loss.item())
-                    else:
-                        loss = None
+                    loss = self.worker.compute_loss(logits, batch)
+                    if loss is not None:
+                        loss_val = float(loss.detach().item())
                 # ----- BACKWARD / OPT -----
                 if training_enabled and loss is not None:
                     with self.energy_monitor.mark("backward", step=step, tokens=token_count):
@@ -1540,12 +1601,9 @@ class NetworkWorker:
             logits = self.worker.forward(input_ids)
             if getattr(self.cfg, "enable_tensor_parallel", False):
                 logits = self.tensor_gather(logits, step)
-            if labels is not None:
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    labels.reshape(-1),
-                )
-                loss_val = float(loss.item())
+            loss = self.worker.compute_loss(logits, batch)
+            if loss is not None:
+                loss_val = float(loss.detach().item())
                 if training_enabled:
                     loss.backward()
                     if getattr(self.cfg, "max_grad_norm", 0) and self.cfg.max_grad_norm > 0:
@@ -1567,10 +1625,10 @@ class NetworkWorker:
                     self._send_gradients(grad_payload, step)
                     # ✅ NEW: Safe gradient upload
                     safe_call(
-                        self._send_gradients, 
-                        grad_payload, 
-                        step, 
-                        context="grad_upload_fallback", 
+                        self._send_gradients,
+                        grad_payload,
+                        step,
+                        context="grad_upload_fallback",
                         severity=ErrorSeverity.WARNING,
                         reraise=False
                     )
@@ -1692,21 +1750,21 @@ class NetworkWorker:
         if getattr(self.cfg, "enable_tensor_parallel", False):
             self._last_logits = self.tensor_gather(self._last_logits, step)
 
-        labels = torch.tensor(
+        labels = torch.as_tensor(
             labels_raw,
-            dtype=torch.long,
             device=self.worker.device,
         )
+        batch["labels"] = labels
         token_count = int(labels.numel())
 
         logits = self._last_logits
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-        )
-        loss_val = float(loss.item())
+        loss = self.worker.compute_loss(logits, batch)
+        if loss is not None:
+            loss_val = float(loss.detach().item())
+        else:
+            loss_val = None
 
-        if phase == "train":
+        if phase == "train" and loss is not None:
             if self.energy_monitor:
                 with self.energy_monitor.task(f"train.gpu{self.gpu_id}"):
                     with self.energy_monitor.mark("backward", step=step, tokens=token_count):
@@ -1770,10 +1828,10 @@ class NetworkWorker:
                         else torch.zeros_like(param).cpu()
                     )
                 safe_call(
-                    self._send_gradients, 
-                    grad_payload, 
-                    step, 
-                    context="grad_upload_pipeline_fallback", 
+                    self._send_gradients,
+                    grad_payload,
+                    step,
+                    context="grad_upload_pipeline_fallback",
                     severity=ErrorSeverity.WARNING,
                     reraise=False
                 )
@@ -1799,8 +1857,116 @@ class NetworkWorker:
         if ack_required:
             self._send_command_ack("CONTROL_PIPELINE_PHASE2", step)
 
-        # clear cache for next global step
-        self._last_logits = None
+
+# -------------------------------------------------------------------------
+    # INFERENCE STEP (main inference path)
+    # -------------------------------------------------------------------------
+    def _handle_inference_step(self, msg: Message) -> None:
+        """
+        Single inference forward pass (no backward, no gradient upload).
+        
+        Flow:
+        1. Receive input_ids from orchestrator
+        2. Forward through model
+        3. Gather logits if tensor-parallel
+        4. Send results back via INFERENCE_RESULT_UPLOAD
+        5. Send ACK
+        
+        Telemetry:
+        - Tag as "infer.gpu{gpu_id}" so Universe can distinguish train vs infer
+        - Mark forward section for FLOPs/TFLOPs tracking
+        """
+        step = int(msg.step if msg.step is not None else -1)
+        batch = msg.payload or {}
+        ack_required = bool((msg.metadata or {}).get("ack_required", False))
+        
+        # Ensure model is in eval mode
+        self.worker.set_training_mode(False)
+        
+        # Extract inputs
+        input_ids_raw = batch.get("input_ids")
+        if input_ids_raw is None:
+            print(f"[GPU {self.gpu_id}] inference step missing input_ids")
+            if ack_required:
+                self._send_command_ack("CONTROL_INFERENCE_STEP", step)
+            return
+        
+        # Normalize to tensor on device
+        if isinstance(input_ids_raw, torch.Tensor):
+            input_ids = input_ids_raw.to(self.device, non_blocking=True)
+        else:
+            input_ids = torch.as_tensor(input_ids_raw, dtype=torch.long, device=self.device)
+        
+        token_count = int(input_ids.numel())
+        
+        # Forward pass (no gradients)
+        if self.energy_monitor:
+            with self.energy_monitor.task(f"infer.gpu{self.gpu_id}"):
+                with self.energy_monitor.mark("forward", step=step, tokens=token_count):
+                    with torch.inference_mode():
+                        logits = self.worker.forward(input_ids)
+                        
+                        # TP gather if enabled
+                        if getattr(self.cfg, "enable_tensor_parallel", False):
+                            logits = self.tensor_gather(logits, step)
+        else:
+            with torch.inference_mode():
+                logits = self.worker.forward(input_ids)
+                if getattr(self.cfg, "enable_tensor_parallel", False):
+                    logits = self.tensor_gather(logits, step)
+        
+        # Send results back to orchestrator
+        self._send_inference_results(
+            logits=logits,
+            step=step,
+            token_count=token_count,
+        )
+        
+        # ACK back to orchestrator
+        if ack_required:
+            self._send_command_ack("CONTROL_INFERENCE_STEP", step)
+    
+    def _send_inference_results(
+        self, 
+        logits: torch.Tensor,
+        step: int,
+        token_count: int,
+    ) -> None:
+        """
+        Send inference outputs to orchestrator via +9 socket (new channel).
+        
+        Payload format:
+        {
+            "logits": tensor on CPU,
+            "step": global step,
+            "token_count": tokens processed,
+            "timestamp": when completed,
+        }
+        """
+        try:
+            # Connect to inference results listener (master_port+9)
+            result_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            optimize_socket_for_network(result_sock, buf_bytes=self._sock_buf_bytes)
+            result_sock.connect((self.master_ip, self.master_port + 9))
+            
+            # Build message
+            msg = Message(
+                msg_type=MessageType.INFERENCE_RESULT_UPLOAD,
+                payload={
+                    "logits": logits.detach().cpu(),  # Move to CPU for network transfer
+                    "step": step,
+                    "token_count": token_count,
+                    "timestamp": time.time(),
+                },
+                step=step,
+                gpu_id=self.gpu_id,
+            )
+            
+            MessageProtocol.send_message(result_sock, msg, compress=True)
+            result_sock.close()
+            
+        except Exception as e:
+            print(f"[GPU {self.gpu_id}] failed to send inference results: {e}")
 
     # -------------------------------------------------------------------------
     # ACTIVATION_FRAME (future: relay activations from one shard to next)

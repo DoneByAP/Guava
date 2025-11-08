@@ -58,6 +58,10 @@ class MessageType(Enum):
     TENSOR_BACKWARD_REDUCE = "TENSOR_BACKWARD_REDUCE"
     TENSOR_SYNC_BARRIER = "TENSOR_SYNC_BARRIER"
 
+    # ---------------- Inference Control ----------------
+    CONTROL_INFERENCE_STEP = "CONTROL_INFERENCE_STEP"
+    INFERENCE_RESULT_UPLOAD = "INFERENCE_RESULT_UPLOAD"
+    CONTROL_INFERENCE_BATCH = "CONTROL_INFERENCE_BATCH"  # For pipeline inference
 
 # ✅ NEW: Custom exception for message corruption
 class MessageCorruptedError(Exception):

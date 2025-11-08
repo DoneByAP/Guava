@@ -33,7 +33,7 @@ Example Usage:
     worker.connect_and_train()
 """
 
-__version__ = "0.7.3"  # 🚀 energy-aware upgrade
+__version__ = "0.7.7"  # 🚀 energy-aware upgrade
 
 from .config import DistributedConfig, ParallelismStrategy
 from .orchestrator import Orchestrator

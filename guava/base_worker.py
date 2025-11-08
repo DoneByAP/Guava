@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol
 import logging
 
+from .training_components import build_loss_handler, build_optimizer
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,6 +109,7 @@ class BaseWorker(TensorParallelMixin, ABC):
         self.model: nn.Module = None
         self.optimizer: torch.optim.Optimizer = None
         self.is_training: bool = False
+        self.loss_handler = build_loss_handler(self.config, device=self.device)
 
         # TP plumbing
         self.tp_adapter: TensorParallelAdapter = tp_adapter or _NoOpTPAdapter()
@@ -194,6 +197,7 @@ class BaseWorker(TensorParallelMixin, ABC):
             torch.cuda.empty_cache()
 
         logger.info(f"Worker {self.gpu_id}: Cleaned up")
+        self.loss_handler = None
 
 
 class ModelShardWorker(BaseWorker):
@@ -229,12 +233,7 @@ class ModelShardWorker(BaseWorker):
         We move it to our device and make an optimizer on those params.
         """
         self.model = model.to(self.device)
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        self.optimizer = build_optimizer(self.config, self.model.parameters())
 
         logger.info(
             f"Worker {self.gpu_id}: Registered model shard with {self.num_layers} layers"
@@ -303,12 +302,7 @@ class DataParallelWorker(BaseWorker):
         model: full model replica.
         """
         self.model = model.to(self.device)
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        self.optimizer = build_optimizer(self.config, self.model.parameters())
 
         logger.info(f"Worker {self.gpu_id}: Registered full model for data parallelism")
 
@@ -353,10 +347,22 @@ class DataParallelWorker(BaseWorker):
                 self.model.parameters(), self.config.max_grad_norm
             )
 
-    def compute_loss_and_backward(self, logits: torch.Tensor, labels: torch.Tensor) -> float:
+    def compute_loss(self, logits: torch.Tensor, batch: Optional[Dict[str, Any]] = None) -> Optional[torch.Tensor]:
+        """Compute loss for the provided logits using the configured handler."""
+        if self.loss_handler is None:
+            return None
+        batch = batch or {}
+        return self.loss_handler.compute(logits, batch, device=self.device)
+
+    def compute_loss_and_backward(
+        self,
+        logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        batch: Optional[Dict[str, Any]] = None,
+    ) -> Optional[float]:
         """
         Full local training step:
-        - compute CE loss
+        - compute configurable loss
         - backward()
         - clip gradients
         Returns scalar loss for logging.
@@ -364,10 +370,13 @@ class DataParallelWorker(BaseWorker):
         If you want TP grad-all-reduce per-parameter here, do it in the caller
         (e.g., NetworkWorker) by iterating params and calling tensor_reduce_grad.
         """
-        labels = labels.to(self.device, non_blocking=True)
+        effective_batch: Dict[str, Any] = batch.copy() if batch else {}
+        if labels is not None:
+            effective_batch.setdefault(getattr(self.loss_handler, "label_key", "labels"), labels)
 
-        loss_fn = nn.CrossEntropyLoss()
-        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss = self.compute_loss(logits, effective_batch)
+        if loss is None:
+            return None
 
         if self.is_training:
             loss.backward()
@@ -378,7 +387,7 @@ class DataParallelWorker(BaseWorker):
                     self.config.max_grad_norm
                 )
 
-        return float(loss.item())
+        return float(loss.detach().item())
 
     def get_gradients(self) -> List[torch.Tensor]:
         """
