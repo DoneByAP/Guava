@@ -629,7 +629,7 @@ Guava is offered under a **dual license**:
   - You sell Guava-powered compute access.
 
 For commercial licensing, contact:  
-📧 azanipeterking@gmail.com
+📧 azani@peterkinlabs.com
 
 ---
 
