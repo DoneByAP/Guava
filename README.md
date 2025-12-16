@@ -142,12 +142,7 @@ Once PyTorch is working in that venv:
 
 **Normal / public (when published):**
 ```bash
-pip install guava
-```
-
-**During development (TestPyPI sandbox):**
-```bash
-pip install --extra-index-url https://test.pypi.org/simple/ guava
+pip install guava-ml
 ```
 
 Now you can import the primitives:
