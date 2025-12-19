@@ -638,6 +638,6 @@ For commercial licensing, contact:
 - **Issues:** GitHub Issues (open an issue with logs and config details)
 - **Docs / Examples:** more launch recipes coming
 - **Discord / Community:** coming
-- Artifical intelgiece was used in this development.
+- Artifical intelligence  was used in this development.
 
 **Made with ❤️ for the ML community**
