@@ -636,8 +636,7 @@ For commercial licensing, contact:
 ## 📮 Support
 
 - **Issues:** GitHub Issues (open an issue with logs and config details)
-- **Docs / Examples:** more launch recipes coming
-- **Discord / Community:** coming
+- **Docs / Examples:** https://peterkinlabs.com/guava-ml 
 - Artifical intelligence  was used in this development.
 
 **Made with ❤️ for the ML community**
